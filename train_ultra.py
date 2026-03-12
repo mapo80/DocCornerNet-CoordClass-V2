@@ -506,7 +506,7 @@ def main():
             lr_now = float(args.learning_rate)
 
         # Track bests
-        is_best_iou = iou > best_iou and iou > 0
+        is_best_iou = iou > best_iou and iou > 0.01
         if is_best_iou:
             best_iou = iou
             net.save_weights(str(output_dir / "best_model.weights.h5"))
