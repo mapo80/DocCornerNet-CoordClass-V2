@@ -235,28 +235,39 @@ def load_dataset_fast(data_root, split, img_size, num_workers=32):
 # tf.data pipeline builder
 # --------------------------------------------------------------------------
 
+def _normalize_image(image, image_norm):
+    """Normalize a single uint8 image to float32 (used inside tf.data.map)."""
+    img = tf.cast(image, tf.float32)
+    if image_norm == "imagenet":
+        img = img / 255.0
+        img = (img - IMAGENET_MEAN) / IMAGENET_STD
+    elif image_norm == "zero_one":
+        img = img / 255.0
+    # else: raw255
+    return img
+
+
 def make_tf_dataset(
     images, coords, has_doc,
     batch_size, shuffle, image_norm="imagenet",
     drop_remainder=False,
 ):
-    """Build tf.data pipeline from numpy arrays (no augmentation)."""
-    # Normalize images to float32
-    imgs_f = images.astype(np.float32)
-    if image_norm == "imagenet":
-        imgs_f = imgs_f / 255.0
-        imgs_f = (imgs_f - IMAGENET_MEAN) / IMAGENET_STD
-    elif image_norm == "zero_one":
-        imgs_f = imgs_f / 255.0
-    # else: raw255
+    """Build tf.data pipeline from numpy arrays (no augmentation).
 
+    Images are kept as uint8 and normalized lazily per-batch to avoid
+    allocating a full float32 copy of the dataset in memory.
+    """
     ds = tf.data.Dataset.from_tensor_slices((
-        imgs_f,
+        images,  # keep uint8, normalize lazily
         {"coords": coords, "has_doc": has_doc},
     ))
     if shuffle:
         ds = ds.shuffle(buffer_size=min(len(images), 10000))
     ds = ds.batch(batch_size, drop_remainder=drop_remainder)
+    ds = ds.map(
+        lambda img, tgt: (_normalize_image(img, image_norm), tgt),
+        num_parallel_calls=tf.data.AUTOTUNE,
+    )
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 
@@ -398,15 +409,20 @@ def main():
     n_train = len(train_images)
     n_val = len(val_images)
 
+    print(f"Creating train dataset ({n_train} images)...", end=" ", flush=True)
     train_ds = make_tf_dataset(
         train_images, train_coords, train_has_doc,
         args.batch_size, shuffle=True, image_norm=args.input_norm,
         drop_remainder=True,
     )
+    print("done", flush=True)
+
+    print(f"Creating val dataset ({n_val} images)...", end=" ", flush=True)
     val_ds = make_tf_dataset(
         val_images, val_coords, val_has_doc,
         args.batch_size, shuffle=False, image_norm=args.input_norm,
     )
+    print("done", flush=True)
 
     train_steps = n_train // args.batch_size
     val_steps = math.ceil(n_val / args.batch_size)
@@ -415,6 +431,13 @@ def main():
     bw = args.backbone_weights
     if bw and bw.strip().lower() in ("none", "null"):
         bw = None
+
+    # Skip backbone download when using init_weights (all weights will be overwritten)
+    if args.init_weights and bw == "imagenet":
+        print("Skipping ImageNet backbone download (--init_weights will overwrite all weights)")
+        bw = None
+
+    print("Building model...", end=" ", flush=True)
     net = create_model(
         alpha=args.alpha,
         fpn_ch=args.fpn_ch,
@@ -425,7 +448,7 @@ def main():
         backbone_weights=bw,
         simcc_kernel_size=args.simcc_kernel_size,
     )
-    print(f"Model parameters: {net.count_params():,}")
+    print(f"done ({net.count_params():,} params)")
 
     # Optionally load init weights
     if args.init_weights:
