@@ -138,47 +138,47 @@ python -m train_ultra \
 
 **Data & I/O:**
 
-| Argument | Default | Description |
-|---|---|---|
-| `--data_root` | (required) | Dataset root directory |
-| `--output_dir` | `./runs/v2` | Output directory for weights and logs |
-| `--input_norm` | `imagenet` | Input normalization (`imagenet`, `zero_one`, `raw255`) |
-| `--num_workers` | `32` | Threads for parallel parquet/data loading |
+| Argument | Default | Description | Notes |
+|---|---|---|---|
+| `--data_root` | (required) | Dataset root directory | Auto-detects parquet vs file-based format |
+| `--output_dir` | `./runs/v2` | Output directory for weights and logs | Created automatically if missing |
+| `--input_norm` | `imagenet` | Input normalization (`imagenet`, `zero_one`, `raw255`) | Use `imagenet` with `--backbone_weights imagenet`. Use `raw255` for custom pipelines with no normalization |
+| `--num_workers` | `32` | Threads for parallel parquet/data loading | Set to CPU core count. Diminishing returns above 32. Only affects initial data loading, not training |
 
 **Model architecture:**
 
-| Argument | Default | Description |
-|---|---|---|
-| `--alpha` | `0.35` | MobileNetV2 width multiplier |
-| `--fpn_ch` | `32` | FPN feature channels |
-| `--simcc_ch` | `96` | SimCC Conv1D hidden channels |
-| `--img_size` | `224` | Input image size (square) |
-| `--num_bins` | `224` | Number of SimCC coordinate bins |
-| `--tau` | `1.0` | SimCC decode temperature (soft-argmax) |
-| `--simcc_kernel_size` | `5` | SimCC Conv1D kernel size |
-| `--backbone_weights` | `imagenet` | Backbone init (`imagenet` or `none`) |
+| Argument | Default | Description | Notes |
+|---|---|---|---|
+| `--alpha` | `0.35` | MobileNetV2 width multiplier | 0.35 = ~496K params. Higher (0.5, 1.0) increases capacity and latency. Keep 0.35 for TFLite mobile deployment |
+| `--fpn_ch` | `32` | FPN feature channels | Tied to backbone output width at alpha=0.35. Increasing adds params quadratically in conv layers |
+| `--simcc_ch` | `96` | SimCC Conv1D hidden channels | Controls capacity of the coordinate classification head. 64-128 reasonable range |
+| `--img_size` | `224` | Input image size (square) | Must match `--num_bins` unless you want sub-pixel binning. 224 is standard MobileNet input |
+| `--num_bins` | `224` | Number of SimCC coordinate bins | Resolution of coordinate output. Higher = finer precision but larger logit tensors. Typically equal to `--img_size` |
+| `--tau` | `1.0` | SimCC decode temperature (soft-argmax) | <1.0 = sharper peaks (more confident), >1.0 = smoother. Affects inference only, not loss |
+| `--simcc_kernel_size` | `5` | SimCC Conv1D kernel size | Receptive field of 1D classifier. 3-7 reasonable. Odd values only |
+| `--backbone_weights` | `imagenet` | Backbone init (`imagenet` or `none`) | Always use `imagenet` for real training. Use `none` only for smoke tests or architecture debugging |
 
 **Training schedule:**
 
-| Argument | Default | Description |
-|---|---|---|
-| `--batch_size` | `32` | Batch size |
-| `--epochs` | `100` | Number of training epochs |
-| `--learning_rate` | `2e-4` | Base learning rate (cosine schedule with warmup) |
-| `--weight_decay` | `1e-4` | AdamW weight decay |
-| `--warmup_epochs` | `5` | Linear warmup epochs |
-| `--init_weights` | `None` | Path to `.weights.h5` for warm start |
+| Argument | Default | Description | Notes |
+|---|---|---|---|
+| `--batch_size` | `32` | Batch size | 32-64 for small datasets (<5K). Scale LR linearly if increasing batch size (2e-4 calibrated for bs=32) |
+| `--epochs` | `100` | Number of training epochs | Monitor val IoU plateau. Small datasets may overfit before 100 epochs |
+| `--learning_rate` | `2e-4` | Base learning rate (cosine schedule with warmup) | Scale linearly with batch size. 2e-4 for bs=32, ~4e-4 for bs=64, ~8e-4 for bs=128 |
+| `--weight_decay` | `1e-4` | AdamW weight decay | Increase to 5e-4 if overfitting (train loss << val loss). Decrease if underfitting |
+| `--warmup_epochs` | `5` | Linear warmup epochs | 5-10% of total epochs. Prevents early divergence with pretrained backbone |
+| `--init_weights` | `None` | Path to `.weights.h5` for warm start | Use for fine-tuning or resuming interrupted training. Loads all layers by name |
 
 **Loss configuration:**
 
-| Argument | Default | Description |
-|---|---|---|
-| `--sigma_px` | `2.0` | Gaussian target sigma in pixels |
-| `--loss_tau` | `0.5` | Temperature for SimCC log-softmax loss |
-| `--w_simcc` | `1.0` | SimCC cross-entropy loss weight |
-| `--w_coord` | `0.2` | Coordinate L1 loss weight |
-| `--w_score` | `1.0` | Score BCE loss weight |
-| `--label_smoothing` | `0.0` | Label smoothing for SimCC targets (0=disabled) |
+| Argument | Default | Description | Notes |
+|---|---|---|---|
+| `--sigma_px` | `2.0` | Gaussian target sigma in pixels | Controls target distribution width. 1.5-3.0 typical. Lower = sharper targets, harder to learn. Higher = easier but less precise |
+| `--loss_tau` | `0.5` | Temperature for SimCC log-softmax loss | Separate from decode `--tau`. Lower = sharper gradients, can cause instability. 0.3-1.0 reasonable range |
+| `--w_simcc` | `1.0` | SimCC cross-entropy loss weight | Primary corner loss. Keep at 1.0 as reference, adjust others relative to this |
+| `--w_coord` | `0.2` | Coordinate L1 loss weight | Auxiliary direct supervision. 0.1-0.5 typical. Higher helps early convergence but can conflict with SimCC at fine scale |
+| `--w_score` | `1.0` | Score BCE loss weight | Document presence classification. Reduce to 0.5 if dataset is heavily imbalanced (few negatives) |
+| `--label_smoothing` | `0.0` | Label smoothing for SimCC targets (0=disabled) | 0.01-0.05 for large datasets to prevent overconfidence. Avoid on small datasets (<5K), slows convergence |
 
 ### Training Outputs
 
