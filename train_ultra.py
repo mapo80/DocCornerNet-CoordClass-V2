@@ -483,11 +483,10 @@ def main():
         iou = detailed["mean_iou"]
         val_loss = val_m["loss"]
         val_err = detailed["corner_error_px"]
-        lr_val = optimizer.learning_rate
-        if callable(lr_val):
-            lr_now = float(lr_val(optimizer.iterations))
-        else:
-            lr_now = float(lr_val)
+        try:
+            lr_now = float(lr_schedule(optimizer.iterations))
+        except Exception:
+            lr_now = float(args.learning_rate)
 
         # Track bests
         is_best_iou = iou > best_iou
