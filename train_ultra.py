@@ -22,6 +22,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from PIL import Image
+from tqdm import tqdm
 
 from model import create_model
 from losses import DocCornerNetV2Trainer
@@ -133,7 +134,7 @@ def load_dataset_parquet(data_root, split, img_size):
                   "corner_br_x", "corner_br_y", "corner_bl_x", "corner_bl_y"]
 
     n_valid = 0
-    for i in range(n_images):
+    for i in tqdm(range(n_images), desc=f"  Loading {split}", ncols=80, leave=True):
         try:
             img_struct = img_col[i].as_py()
             img_bytes = img_struct["bytes"]
@@ -157,7 +158,7 @@ def load_dataset_parquet(data_root, split, img_size):
     images = images[:n_valid]
     coords = coords[:n_valid]
     has_doc = has_doc[:n_valid]
-    print(f"  Loaded {n_valid}/{n_images} valid images", flush=True)
+    print(f"  {n_valid}/{n_images} valid ({int((has_doc == 1).sum())} pos, {int((has_doc == 0).sum())} neg)", flush=True)
     return images, coords, has_doc
 
 
@@ -188,7 +189,9 @@ def load_dataset_fast(data_root, split, img_size, num_workers=32):
     args_list = [(name, str(data_root), img_size) for name in image_names]
     results = []
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        for result in executor.map(_load_single_image, args_list):
+        for result in tqdm(executor.map(_load_single_image, args_list),
+                           total=n_images, desc=f"  Loading {split}",
+                           ncols=80, leave=True):
             if result is not None:
                 results.append(result)
 
@@ -204,7 +207,7 @@ def load_dataset_fast(data_root, split, img_size, num_workers=32):
 
     del results
     gc.collect()
-    print(f"  Loaded {n_valid}/{n_images} valid images", flush=True)
+    print(f"  {n_valid}/{n_images} valid ({int((has_doc == 1).sum())} pos, {int((has_doc == 0).sum())} neg)", flush=True)
     return images, coords, has_doc
 
 
@@ -345,12 +348,16 @@ def main():
     print("=" * 60)
 
     # Load data
+    print("\n--- Data Loading ---")
     train_images, train_coords, train_has_doc = load_dataset_fast(
         args.data_root, "train", args.img_size, args.num_workers,
     )
     val_images, val_coords, val_has_doc = load_dataset_fast(
         args.data_root, "val", args.img_size, args.num_workers,
     )
+
+    n_train = len(train_images)
+    n_val = len(val_images)
 
     train_ds = make_tf_dataset(
         train_images, train_coords, train_has_doc,
@@ -361,6 +368,9 @@ def main():
         val_images, val_coords, val_has_doc,
         args.batch_size, shuffle=False, augment=False, image_norm=args.input_norm,
     )
+
+    train_steps = n_train // args.batch_size
+    val_steps = math.ceil(n_val / args.batch_size)
 
     # Build model
     bw = args.backbone_weights
@@ -412,24 +422,49 @@ def main():
 
     trainer.compile(optimizer=optimizer)
 
+    # Print config summary
+    print(f"\n--- Configuration ---")
+    print(f"  Model:    alpha={args.alpha} fpn_ch={args.fpn_ch} simcc_ch={args.simcc_ch}")
+    print(f"  Input:    {args.img_size}x{args.img_size} bins={args.num_bins} norm={args.input_norm}")
+    print(f"  Training: epochs={args.epochs} batch={args.batch_size} lr={args.learning_rate}")
+    print(f"  Loss:     sigma_px={args.sigma_px} loss_tau={args.loss_tau} "
+          f"w_simcc={args.w_simcc} w_coord={args.w_coord} w_score={args.w_score}")
+    print(f"  Schedule: warmup={args.warmup_epochs}ep cosine wd={args.weight_decay}")
+    print(f"  Steps:    {train_steps}/ep train, {val_steps}/ep val")
+
     # Training loop
+    print(f"\n--- Training ---")
     val_metrics = ValidationMetrics(img_size=args.img_size)
     best_iou = 0.0
+    best_val_loss = float("inf")
+    prev_val_loss = None
+    prev_iou = None
+    prev_err = None
+    prev_lr = None
     log_rows = []
+    total_t0 = time.time()
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
         # Train
         trainer.reset_metrics()
-        for batch in train_ds:
+        train_pbar = tqdm(train_ds, total=train_steps,
+                          desc=f"  Epoch {epoch}/{args.epochs} [Train]",
+                          leave=False, ncols=100)
+        for batch in train_pbar:
             trainer.train_step(batch)
+            train_pbar.set_postfix(loss=f"{float(trainer.loss_tracker.result()):.4f}")
+        train_pbar.close()
         train_m = {k: float(v) for k, v in trainer._get_metrics_dict().items()}
 
         # Validate
         trainer.reset_metrics()
         val_metrics.reset()
-        for images, targets in val_ds:
+        val_pbar = tqdm(val_ds, total=val_steps,
+                        desc=f"  Epoch {epoch}/{args.epochs} [Val]  ",
+                        leave=False, ncols=100)
+        for images, targets in val_pbar:
             trainer.test_step((images, targets))
             outputs = net(images, training=False)
             coords_pred = outputs["coords"].numpy()
@@ -439,38 +474,127 @@ def main():
                 coords_pred, targets["coords"].numpy(),
                 score_pred, targets["has_doc"].numpy(),
             )
+            val_pbar.set_postfix(loss=f"{float(trainer.loss_tracker.result()):.4f}")
+        val_pbar.close()
         val_m = {k: float(v) for k, v in trainer._get_metrics_dict().items()}
         detailed = val_metrics.compute()
 
         epoch_time = time.time() - t0
         iou = detailed["mean_iou"]
+        val_loss = val_m["loss"]
+        val_err = detailed["corner_error_px"]
+        lr_val = optimizer.learning_rate
+        if callable(lr_val):
+            lr_now = float(lr_val(optimizer.iterations))
+        else:
+            lr_now = float(lr_val)
 
-        print(
-            f"Epoch {epoch:3d}/{args.epochs} | "
-            f"train_loss={train_m['loss']:.4f} | "
-            f"val_loss={val_m['loss']:.4f} | "
-            f"val_iou={iou:.4f} | "
-            f"val_err={detailed['corner_error_px']:.2f}px | "
-            f"{epoch_time:.1f}s",
-            flush=True,
-        )
-
-        # Save best
-        if iou > best_iou:
+        # Track bests
+        is_best_iou = iou > best_iou
+        if is_best_iou:
             best_iou = iou
             net.save_weights(str(output_dir / "best_model.weights.h5"))
-            print(f"  -> New best IoU: {best_iou:.4f}")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+
+        # ETA
+        elapsed = time.time() - total_t0
+        avg_epoch = elapsed / epoch
+        remaining = avg_epoch * (args.epochs - epoch)
+        if remaining >= 3600:
+            eta_str = f"{remaining/3600:.1f}h"
+        elif remaining >= 60:
+            eta_str = f"{remaining/60:.0f}m"
+        else:
+            eta_str = f"{remaining:.0f}s"
+
+        # Delta helpers
+        def _delta_str(curr, prev, lower_is_better=True):
+            if prev is None:
+                return ""
+            d = curr - prev
+            arrow = "▼" if d < 0 else "▲" if d > 0 else "="
+            # For lower-is-better: ▼ is good. For higher-is-better: ▲ is good.
+            sign = "+" if d > 0 else ""
+            return f" {arrow} {sign}{d:.4f}"
+
+        def _delta_str_px(curr, prev):
+            if prev is None:
+                return ""
+            d = curr - prev
+            arrow = "▼" if d < 0 else "▲" if d > 0 else "="
+            sign = "+" if d > 0 else ""
+            return f" {arrow} {sign}{d:.2f}px"
+
+        def _lr_delta(curr, prev):
+            if prev is None or abs(curr - prev) < 1e-12:
+                return ""
+            arrow = "▼" if curr < prev else "▲"
+            return f" {arrow} (was {prev:.2e})"
+
+        # Loss gap (overfitting indicator)
+        gap = val_loss - train_m["loss"]
+        gap_warn = ""
+        if len(log_rows) >= 2:
+            prev_gap = log_rows[-1]["val_loss"] - log_rows[-1]["train_loss"]
+            if gap > prev_gap + 0.1:
+                gap_warn = " (growing)"
+
+        # Print epoch summary
+        sep = "-" * 70
+        print(sep)
+        print(f"  Epoch {epoch:3d}/{args.epochs}"
+              f"{'':>40}{epoch_time:.1f}s  ETA {eta_str}")
+        print(f"  |- Loss       train={train_m['loss']:.4f}"
+              f"       val={val_loss:.4f}"
+              f"{_delta_str(val_loss, prev_val_loss)}"
+              f"  gap={gap:.2f}{gap_warn}")
+        iou_line = (f"  |- IoU        train={train_m['iou']:.4f}"
+                    f"       val={iou:.4f}"
+                    f"{_delta_str(iou, prev_iou, lower_is_better=False)}"
+                    f"  best={best_iou:.4f}")
+        if is_best_iou:
+            iou_line += " ★ NEW BEST"
+        print(iou_line)
+        print(f"  |- Error      train={train_m['corner_err_px']:.2f}px"
+              f"      val={val_err:.2f}px"
+              f"{_delta_str_px(val_err, prev_err)}"
+              f"  p95={detailed['corner_error_p95_px']:.2f}px")
+        print(f"  |- Recall     @90={detailed['recall_90']*100:.0f}%"
+              f"  @95={detailed['recall_95']*100:.0f}%"
+              f"  @99={detailed['recall_99']*100:.0f}%")
+        print(f"  |- Score      cls_f1={detailed['cls_f1']*100:.0f}%"
+              f"  acc={detailed['cls_accuracy']*100:.0f}%")
+        print(f"  '- LR         {lr_now:.2e}{_lr_delta(lr_now, prev_lr)}")
+
+        # Update prev values for next epoch
+        prev_val_loss = val_loss
+        prev_iou = iou
+        prev_err = val_err
+        prev_lr = lr_now
 
         log_rows.append({
             "epoch": epoch,
             "train_loss": train_m["loss"],
-            "val_loss": val_m["loss"],
+            "train_iou": train_m["iou"],
+            "train_corner_err_px": train_m["corner_err_px"],
+            "val_loss": val_loss,
             "val_mean_iou": iou,
-            "val_corner_error_px": detailed["corner_error_px"],
+            "val_median_iou": detailed["median_iou"],
+            "val_corner_error_px": val_err,
+            "val_corner_error_p95_px": detailed["corner_error_p95_px"],
+            "val_recall_90": detailed["recall_90"],
+            "val_recall_95": detailed["recall_95"],
+            "val_recall_99": detailed["recall_99"],
+            "val_cls_f1": detailed["cls_f1"],
+            "val_cls_accuracy": detailed["cls_accuracy"],
+            "lr": lr_now,
+            "loss_gap": gap,
             "epoch_time": epoch_time,
         })
 
     # Save final
+    total_time = time.time() - total_t0
     net.save_weights(str(output_dir / "final_model.weights.h5"))
 
     # Save training log
@@ -480,8 +604,18 @@ def main():
         writer.writeheader()
         writer.writerows(log_rows)
 
-    print(f"\nTraining complete. Best IoU: {best_iou:.4f}")
-    print(f"Artifacts saved to: {output_dir}")
+    # Final summary
+    best_row = max(log_rows, key=lambda r: r["val_mean_iou"])
+    print("=" * 70)
+    print(f"  TRAINING COMPLETE")
+    print(f"  |- Time        {total_time/60:.1f} min ({args.epochs} epochs)")
+    print(f"  |- Best epoch  {best_row['epoch']}")
+    print(f"  |- Best IoU    {best_row['val_mean_iou']:.4f} (median {best_row['val_median_iou']:.4f})")
+    print(f"  |- Error       {best_row['val_corner_error_px']:.2f}px (p95 {best_row['val_corner_error_p95_px']:.2f}px)")
+    print(f"  |- Recall      @90={best_row['val_recall_90']*100:.1f}%  @95={best_row['val_recall_95']*100:.1f}%  @99={best_row['val_recall_99']*100:.1f}%")
+    print(f"  |- Score       cls_f1={best_row['val_cls_f1']*100:.1f}%  acc={best_row['val_cls_accuracy']*100:.1f}%")
+    print(f"  '- Artifacts   {output_dir}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
