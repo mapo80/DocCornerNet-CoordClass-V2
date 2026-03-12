@@ -109,9 +109,68 @@ def _load_single_image(args):
         return None
 
 
+def load_dataset_parquet(data_root, split, img_size):
+    """Load dataset from parquet files (HuggingFace format)."""
+    import io
+    import pyarrow.parquet as pq
+
+    split_dir = Path(data_root) / split
+    parquet_files = sorted(split_dir.glob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files in {split_dir}")
+
+    table = pq.read_table(split_dir)
+    n_images = table.num_rows
+    print(f"Loading {split}: {n_images} images from {len(parquet_files)} parquet file(s)", flush=True)
+
+    images = np.empty((n_images, img_size, img_size, 3), dtype=np.uint8)
+    coords = np.empty((n_images, 8), dtype=np.float32)
+    has_doc = np.empty(n_images, dtype=np.float32)
+
+    img_col = table.column("image")
+    is_neg_col = table.column("is_negative")
+    coord_cols = ["corner_tl_x", "corner_tl_y", "corner_tr_x", "corner_tr_y",
+                  "corner_br_x", "corner_br_y", "corner_bl_x", "corner_bl_y"]
+
+    n_valid = 0
+    for i in range(n_images):
+        try:
+            img_struct = img_col[i].as_py()
+            img_bytes = img_struct["bytes"]
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            img = img.resize((img_size, img_size), Image.BILINEAR)
+            images[n_valid] = np.asarray(img, dtype=np.uint8)
+
+            is_neg = is_neg_col[i].as_py()
+            if is_neg:
+                coords[n_valid] = 0.0
+                has_doc[n_valid] = 0.0
+            else:
+                c = np.array([table.column(cn)[i].as_py() for cn in coord_cols], dtype=np.float32)
+                coords[n_valid] = c
+                has_doc[n_valid] = 1.0 if c.sum() > 0 else 0.0
+
+            n_valid += 1
+        except Exception:
+            continue
+
+    images = images[:n_valid]
+    coords = coords[:n_valid]
+    has_doc = has_doc[:n_valid]
+    print(f"  Loaded {n_valid}/{n_images} valid images", flush=True)
+    return images, coords, has_doc
+
+
 def load_dataset_fast(data_root, split, img_size, num_workers=32):
-    """Load dataset using threading."""
+    """Load dataset using threading (file-based) or parquet."""
     data_root = Path(data_root)
+
+    # Check for parquet format first
+    split_dir = data_root / split
+    if split_dir.is_dir() and any(split_dir.glob("*.parquet")):
+        return load_dataset_parquet(data_root, split, img_size)
+
+    # Fall back to file-based format
     split_file = data_root / f"{split}.txt"
     if not split_file.exists():
         for suffix in ["_with_negative_v2", "_with_negative"]:

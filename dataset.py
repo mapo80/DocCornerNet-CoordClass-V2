@@ -159,6 +159,110 @@ def normalize_image(image: np.ndarray, method: str = "imagenet") -> np.ndarray:
     return img.astype(np.float32)
 
 
+def _load_from_parquet(split_dir, img_size):
+    """Load images and labels from parquet files (HuggingFace format)."""
+    import io
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(split_dir)
+    n = table.num_rows
+
+    img_col = table.column("image")
+    is_neg_col = table.column("is_negative")
+    coord_cols = ["corner_tl_x", "corner_tl_y", "corner_tr_x", "corner_tr_y",
+                  "corner_br_x", "corner_br_y", "corner_bl_x", "corner_bl_y"]
+
+    all_images = []
+    all_coords = []
+    all_has_doc = []
+
+    for i in range(n):
+        try:
+            img_bytes = img_col[i].as_py()["bytes"]
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            img = img.resize((img_size, img_size), Image.BILINEAR)
+            all_images.append(np.asarray(img, dtype=np.uint8).copy())
+
+            is_neg = is_neg_col[i].as_py()
+            if is_neg:
+                all_coords.append(np.zeros(8, dtype=np.float32))
+                all_has_doc.append(0.0)
+            else:
+                c = np.array([table.column(cn)[i].as_py() for cn in coord_cols], dtype=np.float32)
+                all_coords.append(c)
+                all_has_doc.append(1.0 if c.sum() > 0 else 0.0)
+        except Exception:
+            continue
+
+    return all_images, all_coords, all_has_doc
+
+
+def _load_from_files(data_root, split, img_size, negative_ratio):
+    """Load images and labels from file-based directory structure."""
+    image_dir = data_root / "images"
+    negative_dir = data_root / "images-negative"
+    label_dir = data_root / "labels"
+
+    split_file = data_root / f"{split}.txt"
+    if not split_file.exists():
+        for suffix in ["_with_negative_v2", "_with_negative"]:
+            candidate = data_root / f"{split}{suffix}.txt"
+            if candidate.exists():
+                split_file = candidate
+                break
+    if not split_file.exists():
+        raise FileNotFoundError(f"No split file for '{split}' in {data_root}")
+
+    image_names = load_split_file(str(split_file))
+
+    positive_names = []
+    negative_names = []
+    for name in image_names:
+        if name.startswith("negative_"):
+            negative_names.append(name)
+        else:
+            positive_names.append(name)
+
+    all_images = []
+    all_coords = []
+    all_has_doc = []
+
+    for name in positive_names:
+        img_path = image_dir / name
+        if not img_path.exists():
+            continue
+        label_path = label_dir / f"{Path(name).stem}.txt"
+        coords = np.zeros(8, dtype=np.float32)
+        has_doc = 0.0
+        if label_path.exists():
+            coords = load_label_yolo_obb(str(label_path))
+            if coords.sum() > 0:
+                has_doc = 1.0
+        img = load_image(str(img_path), img_size)
+        all_images.append(img)
+        all_coords.append(coords)
+        all_has_doc.append(has_doc)
+
+    if negative_ratio > 0 and negative_dir.exists():
+        n_neg_target = int(len(positive_names) * negative_ratio / (1.0 - negative_ratio))
+        neg_available = negative_names
+        if not neg_available:
+            neg_available = [f.name for f in negative_dir.iterdir() if f.suffix in (".jpg", ".jpeg", ".png")]
+        if neg_available:
+            if len(neg_available) > n_neg_target:
+                neg_available = random.sample(neg_available, n_neg_target)
+            for name in neg_available:
+                img_path = negative_dir / name
+                if not img_path.exists():
+                    continue
+                img = load_image(str(img_path), img_size)
+                all_images.append(img)
+                all_coords.append(np.zeros(8, dtype=np.float32))
+                all_has_doc.append(0.0)
+
+    return all_images, all_coords, all_has_doc
+
+
 def create_dataset(
     data_root: str,
     split: str = "train",
@@ -190,70 +294,17 @@ def create_dataset(
         tf.data.Dataset yielding (images, {"coords": ..., "has_doc": ...})
     """
     data_root = Path(data_root)
-    image_dir = data_root / "images"
-    negative_dir = data_root / "images-negative"
-    label_dir = data_root / "labels"
 
-    # Find split file
-    split_file = data_root / f"{split}.txt"
-    if not split_file.exists():
-        for suffix in ["_with_negative_v2", "_with_negative"]:
-            candidate = data_root / f"{split}{suffix}.txt"
-            if candidate.exists():
-                split_file = candidate
-                break
-    if not split_file.exists():
-        raise FileNotFoundError(f"No split file for '{split}' in {data_root}")
-
-    image_names = load_split_file(str(split_file))
-
-    # Separate positive and negative
-    positive_names = []
-    negative_names = []
-    for name in image_names:
-        if name.startswith("negative_"):
-            negative_names.append(name)
-        else:
-            positive_names.append(name)
-
-    # Load all samples
-    all_images = []
-    all_coords = []
-    all_has_doc = []
-
-    for name in positive_names:
-        img_path = image_dir / name
-        if not img_path.exists():
-            continue
-        label_path = label_dir / f"{Path(name).stem}.txt"
-        coords = np.zeros(8, dtype=np.float32)
-        has_doc = 0.0
-        if label_path.exists():
-            coords = load_label_yolo_obb(str(label_path))
-            if coords.sum() > 0:
-                has_doc = 1.0
-        img = load_image(str(img_path), img_size)
-        all_images.append(img)
-        all_coords.append(coords)
-        all_has_doc.append(has_doc)
-
-    # Add negative samples
-    if negative_ratio > 0 and negative_dir.exists():
-        n_neg_target = int(len(positive_names) * negative_ratio / (1.0 - negative_ratio))
-        neg_available = negative_names
-        if not neg_available:
-            neg_available = [f.name for f in negative_dir.iterdir() if f.suffix in (".jpg", ".jpeg", ".png")]
-        if neg_available:
-            if len(neg_available) > n_neg_target:
-                neg_available = random.sample(neg_available, n_neg_target)
-            for name in neg_available:
-                img_path = negative_dir / name
-                if not img_path.exists():
-                    continue
-                img = load_image(str(img_path), img_size)
-                all_images.append(img)
-                all_coords.append(np.zeros(8, dtype=np.float32))
-                all_has_doc.append(0.0)
+    # Check for parquet format first
+    split_dir = data_root / split
+    if split_dir.is_dir() and any(split_dir.glob("*.parquet")):
+        all_images, all_coords, all_has_doc = _load_from_parquet(
+            split_dir, img_size,
+        )
+    else:
+        all_images, all_coords, all_has_doc = _load_from_files(
+            data_root, split, img_size, negative_ratio,
+        )
 
     if not all_images:
         raise ValueError(f"No valid images found for split '{split}' in {data_root}")
