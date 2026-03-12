@@ -1,0 +1,234 @@
+# DocCornerNet V2
+
+Document corner detection with **corner-specific spatial attention**. Detects the four corners of a document in an image and classifies whether a document is present.
+
+496,343 parameters | 224x224 input | TFLite-ready
+
+## Architecture
+
+```
+Input [B, 224, 224, 3]
+    |
+    v
+MobileNetV2 alpha=0.35  -->  C2(56x56), C3(28x28), C4(14x14), C5(7x7)
+    |
+    v
+Mini-FPN top-down: P4->P3->P2 + multi-scale fusion  -->  p_fused [B, 56, 56, 32]
+    |
+    v
+Shared SepConv2D precursor
+    |
+    +--- att_TL --> p_fused * sigmoid(Conv2D(1,1))  -->  feat_TL
+    +--- att_TR --> p_fused * sigmoid(Conv2D(1,1))  -->  feat_TR
+    +--- att_BR --> p_fused * sigmoid(Conv2D(1,1))  -->  feat_BR
+    +--- att_BL --> p_fused * sigmoid(Conv2D(1,1))  -->  feat_BL
+                        |
+                        v
+              Per-corner: AxisMean(H->X, W->Y) -> Resize1D -> shared Conv1D head
+                        |
+                        v
+              4 x (x_logits, y_logits) [B, 4, num_bins]
+                        |
+                        v
+              SimCCDecode (soft-argmax)  -->  coords [B, 8]
+
+Parallel: C5 -> GAP -> Dense(1) -> score_logit [B, 1]
+```
+
+**Key idea**: each corner learns its own spatial attention map before axis marginalization, reducing ambiguity between the four corners while sharing the Conv1D classification weights.
+
+## Requirements
+
+- Python 3.10+
+- TensorFlow 2.18+
+- NumPy, Pillow
+- Shapely 2.x (optional, for polygon IoU metrics)
+- pytest, pytest-cov (for testing)
+
+```bash
+pip install tensorflow numpy pillow shapely pytest pytest-cov
+```
+
+## Dataset Structure
+
+```
+dataset/
+  images/          # Positive images (with documents)
+  images-negative/ # Negative images (no document)
+  labels/          # YOLO OBB format: class x0 y0 x1 y1 x2 y2 x3 y3
+  train.txt        # Image filenames for training
+  val.txt          # Image filenames for validation
+```
+
+Coordinates in label files are normalized to [0, 1]. Corner order: TL, TR, BR, BL.
+Negative image filenames must be prefixed with `negative_`.
+
+## Training
+
+Basic training:
+
+```bash
+python -m train_ultra \
+    --data_root /path/to/dataset \
+    --output_dir runs/v2_experiment \
+    --epochs 100 \
+    --batch_size 32
+```
+
+Full training with all options:
+
+```bash
+python -m train_ultra \
+    --data_root /path/to/dataset \
+    --output_dir runs/v2_full \
+    --epochs 100 \
+    --batch_size 32 \
+    --img_size 224 \
+    --num_bins 224 \
+    --learning_rate 2e-4 \
+    --weight_decay 1e-4 \
+    --warmup_epochs 5 \
+    --sigma_px 2.0 \
+    --loss_tau 0.5 \
+    --w_simcc 1.0 \
+    --w_coord 0.2 \
+    --w_score 1.0 \
+    --backbone_weights imagenet \
+    --num_workers 32
+```
+
+Smoke test on a small dataset (no pretrained backbone):
+
+```bash
+python -m train_ultra \
+    --data_root /path/to/small_dataset \
+    --output_dir runs/v2_smoke \
+    --epochs 5 \
+    --batch_size 16 \
+    --backbone_weights none
+```
+
+Warm start from existing weights:
+
+```bash
+python -m train_ultra \
+    --data_root /path/to/dataset \
+    --output_dir runs/v2_finetune \
+    --epochs 50 \
+    --init_weights runs/v2_experiment/best_model.weights.h5
+```
+
+### Training Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--data_root` | (required) | Dataset root directory |
+| `--output_dir` | `./runs/v2` | Output directory for weights and logs |
+| `--epochs` | `100` | Number of training epochs |
+| `--batch_size` | `32` | Batch size |
+| `--img_size` | `224` | Input image size |
+| `--num_bins` | `224` | Number of SimCC bins |
+| `--learning_rate` | `2e-4` | Base learning rate (cosine schedule) |
+| `--weight_decay` | `1e-4` | AdamW weight decay |
+| `--warmup_epochs` | `5` | Linear warmup epochs |
+| `--sigma_px` | `2.0` | Gaussian target sigma in pixels |
+| `--loss_tau` | `0.5` | Temperature for SimCC log-softmax |
+| `--w_simcc` | `1.0` | SimCC loss weight |
+| `--w_coord` | `0.2` | Coordinate L1 loss weight |
+| `--w_score` | `1.0` | Score BCE loss weight |
+| `--backbone_weights` | `imagenet` | Backbone init (`imagenet` or `none`) |
+| `--init_weights` | `None` | Path to weights for warm start |
+| `--input_norm` | `imagenet` | Normalization (`imagenet`, `zero_one`, `raw255`) |
+| `--num_workers` | `32` | Threads for data loading |
+
+### Training Outputs
+
+```
+runs/v2_experiment/
+  config.json                # Full training configuration
+  best_model.weights.h5      # Best model (highest val IoU)
+  final_model.weights.h5     # Final model (last epoch)
+  training_log.csv           # Per-epoch metrics
+```
+
+## Evaluation
+
+```bash
+python -m evaluate \
+    --model_path runs/v2_experiment \
+    --data_root /path/to/dataset \
+    --split val \
+    --batch_size 32
+```
+
+Reports: mean/median IoU, corner error (mean, p95), recall@90/95/99, classification accuracy/F1.
+
+## Export
+
+TFLite float32:
+
+```bash
+python -m export \
+    --weights runs/v2_experiment \
+    --output_dir exported \
+    --format tflite
+```
+
+TFLite int8 with representative data:
+
+```bash
+python -m export \
+    --weights runs/v2_experiment \
+    --output_dir exported \
+    --format tflite_int8 \
+    --representative_data /path/to/dataset/images
+```
+
+SavedModel + TFLite:
+
+```bash
+python -m export \
+    --weights runs/v2_experiment \
+    --output_dir exported \
+    --format savedmodel tflite
+```
+
+## Tests
+
+```bash
+python -m pytest tests/ -v
+```
+
+With coverage:
+
+```bash
+python -m pytest tests/ --cov=. --cov-report=term-missing
+```
+
+179 tests, 93% coverage.
+
+## Project Structure
+
+```
+v2/
+  model.py          # Model architecture (487 lines)
+  losses.py         # Loss functions and training wrapper
+  dataset.py        # Data loading, augmentation, tf.data pipeline
+  metrics.py        # Validation metrics (IoU, corner error, classification)
+  train_ultra.py    # Training script (cross-platform)
+  evaluate.py       # Evaluation script
+  export.py         # TFLite/SavedModel export + benchmarking
+  tests/            # 179 tests, 93% coverage
+  V2_PROPOSAL.md    # Original design proposal
+  IMPLEMENTATION_NOTES.md
+  IMPLEMENTATION_TRACEABILITY.md
+```
+
+## Model Outputs
+
+| Key | Shape | Description |
+|---|---|---|
+| `simcc_x` | `[B, 4, num_bins]` | X coordinate logits per corner |
+| `simcc_y` | `[B, 4, num_bins]` | Y coordinate logits per corner |
+| `score_logit` | `[B, 1]` | Document presence logit |
+| `coords` | `[B, 8]` | Decoded normalized coordinates (x0,y0,...,x3,y3) |
