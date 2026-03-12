@@ -584,8 +584,12 @@ def main():
               f"  @75={detailed['recall_75']*100:.0f}%"
               f"  @90={detailed['recall_90']*100:.0f}%"
               f"  @95={detailed['recall_95']*100:.0f}%")
-        print(f"  |- Score      cls_f1={detailed['cls_f1']*100:.0f}%"
-              f"  acc={detailed['cls_accuracy']*100:.0f}%")
+        print(f"  |- Score      f1={detailed['cls_f1']*100:.0f}%"
+              f"  prec={detailed['cls_precision']*100:.0f}%"
+              f"  rec={detailed['cls_recall']*100:.0f}%"
+              f"  acc={detailed['cls_accuracy']*100:.0f}%"
+              f"  (TP={detailed['cls_tp']} FP={detailed['cls_fp']}"
+              f" FN={detailed['cls_fn']} TN={detailed['cls_tn']})")
         print(f"  '- LR         {lr_now:.2e}{_lr_delta(lr_now, prev_lr)}")
 
         # Update prev values for next epoch

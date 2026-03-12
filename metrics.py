@@ -173,6 +173,10 @@ class ValidationMetrics:
         tn = int(((pred_labels == 0) & (has_doc == 0)).sum())
         fn = int(((pred_labels == 0) & (has_doc == 1)).sum())
 
+        results["cls_tp"] = tp
+        results["cls_fp"] = fp
+        results["cls_tn"] = tn
+        results["cls_fn"] = fn
         if num_samples > 0:
             results["cls_accuracy"] = (tp + tn) / num_samples
         if tp + fp > 0:
