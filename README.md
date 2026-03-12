@@ -51,6 +51,22 @@ pip install tensorflow numpy pillow shapely pytest pytest-cov
 
 ## Dataset Structure
 
+Two formats are supported (auto-detected):
+
+**HuggingFace Parquet** (recommended):
+
+```
+dataset/
+  train/
+    data-00000-of-00001.parquet
+  val/
+    data-00000-of-00001.parquet
+```
+
+Parquet columns: `image` (struct with JPEG bytes), `filename`, `is_negative`, `corner_tl_x`, `corner_tl_y`, ..., `corner_bl_x`, `corner_bl_y`.
+
+**File-based**:
+
 ```
 dataset/
   images/          # Positive images (with documents)
@@ -120,26 +136,49 @@ python -m train_ultra \
 
 ### Training Arguments
 
+**Data & I/O:**
+
 | Argument | Default | Description |
 |---|---|---|
 | `--data_root` | (required) | Dataset root directory |
 | `--output_dir` | `./runs/v2` | Output directory for weights and logs |
-| `--epochs` | `100` | Number of training epochs |
+| `--input_norm` | `imagenet` | Input normalization (`imagenet`, `zero_one`, `raw255`) |
+| `--num_workers` | `32` | Threads for parallel parquet/data loading |
+
+**Model architecture:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `--alpha` | `0.35` | MobileNetV2 width multiplier |
+| `--fpn_ch` | `32` | FPN feature channels |
+| `--simcc_ch` | `96` | SimCC Conv1D hidden channels |
+| `--img_size` | `224` | Input image size (square) |
+| `--num_bins` | `224` | Number of SimCC coordinate bins |
+| `--tau` | `1.0` | SimCC decode temperature (soft-argmax) |
+| `--simcc_kernel_size` | `5` | SimCC Conv1D kernel size |
+| `--backbone_weights` | `imagenet` | Backbone init (`imagenet` or `none`) |
+
+**Training schedule:**
+
+| Argument | Default | Description |
+|---|---|---|
 | `--batch_size` | `32` | Batch size |
-| `--img_size` | `224` | Input image size |
-| `--num_bins` | `224` | Number of SimCC bins |
-| `--learning_rate` | `2e-4` | Base learning rate (cosine schedule) |
+| `--epochs` | `100` | Number of training epochs |
+| `--learning_rate` | `2e-4` | Base learning rate (cosine schedule with warmup) |
 | `--weight_decay` | `1e-4` | AdamW weight decay |
 | `--warmup_epochs` | `5` | Linear warmup epochs |
+| `--init_weights` | `None` | Path to `.weights.h5` for warm start |
+
+**Loss configuration:**
+
+| Argument | Default | Description |
+|---|---|---|
 | `--sigma_px` | `2.0` | Gaussian target sigma in pixels |
-| `--loss_tau` | `0.5` | Temperature for SimCC log-softmax |
-| `--w_simcc` | `1.0` | SimCC loss weight |
+| `--loss_tau` | `0.5` | Temperature for SimCC log-softmax loss |
+| `--w_simcc` | `1.0` | SimCC cross-entropy loss weight |
 | `--w_coord` | `0.2` | Coordinate L1 loss weight |
 | `--w_score` | `1.0` | Score BCE loss weight |
-| `--backbone_weights` | `imagenet` | Backbone init (`imagenet` or `none`) |
-| `--init_weights` | `None` | Path to weights for warm start |
-| `--input_norm` | `imagenet` | Normalization (`imagenet`, `zero_one`, `raw255`) |
-| `--num_workers` | `32` | Threads for data loading |
+| `--label_smoothing` | `0.0` | Label smoothing for SimCC targets (0=disabled) |
 
 ### Training Outputs
 
@@ -161,7 +200,7 @@ python -m evaluate \
     --batch_size 32
 ```
 
-Reports: mean/median IoU, corner error (mean, p95), recall@90/95/99, classification accuracy/F1.
+Reports: mean/median IoU, corner error (min, mean, p95, max), recall@50/75/90/95, classification accuracy/F1.
 
 ## Export
 
