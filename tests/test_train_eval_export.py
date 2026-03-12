@@ -17,6 +17,7 @@ from metrics import ValidationMetrics
 from train_ultra import (
     WarmupCosineSchedule,
     make_tf_dataset,
+    should_activate_augmentation,
 )
 from export import (
     export_tflite,
@@ -67,8 +68,7 @@ class TestMakeTfDataset:
 
         ds = make_tf_dataset(
             images, coords, has_doc,
-            batch_size=4, shuffle=False, augment=False,
-        )
+            batch_size=4, shuffle=False,         )
         for batch_images, batch_targets in ds.take(1):
             assert batch_images.shape == (4, 224, 224, 3)
             assert batch_targets["coords"].shape == (4, 8)
@@ -82,8 +82,7 @@ class TestMakeTfDataset:
 
         ds = make_tf_dataset(
             images, coords, has_doc,
-            batch_size=4, shuffle=True, augment=False,
-        )
+            batch_size=4, shuffle=True,         )
         assert ds is not None
 
     def test_normalization_zero_one(self):
@@ -94,8 +93,7 @@ class TestMakeTfDataset:
 
         ds = make_tf_dataset(
             images, coords, has_doc,
-            batch_size=4, shuffle=False, augment=False,
-            image_norm="zero_one",
+            batch_size=4, shuffle=False,             image_norm="zero_one",
         )
         for batch_images, _ in ds.take(1):
             np.testing.assert_allclose(batch_images.numpy(), 1.0, atol=1e-5)
@@ -118,6 +116,177 @@ class TestTrainingSmoke:
         }
         metrics = trainer.train_step((x, y))
         assert float(metrics["loss"]) > 0
+
+    def test_training_step_with_augmentation(self):
+        """§11.9: training loop uses augmentation when active."""
+        from dataset import tf_augment_batch, tf_augment_color_only
+
+        net = create_model(backbone_weights=None)
+        trainer = DocCornerNetV2Trainer(net, bins=224, sigma_px=2.0, tau=0.5)
+        trainer.compile(
+            optimizer=keras.optimizers.AdamW(learning_rate=2e-4, weight_decay=1e-4)
+        )
+
+        B = 4
+        images = np.random.randn(B, 224, 224, 3).astype(np.float32)
+        coords = np.random.uniform(0.1, 0.9, (B, 8)).astype(np.float32)
+        has_doc = np.array([1.0, 1.0, 0.0, 1.0], dtype=np.float32)
+
+        # Apply augmentation then train — simulates the training loop
+        import tensorflow as tf
+        images_t = tf.constant(images)
+        coords_t = tf.constant(coords)
+        has_doc_t = tf.constant(has_doc)
+
+        aug_images, aug_coords = tf_augment_batch(
+            images_t, coords_t, has_doc_t,
+            rotation_range=5.0, scale_range=0.0,
+        )
+        targets = {"coords": aug_coords, "has_doc": has_doc_t}
+        metrics = trainer.train_step((aug_images, targets))
+        assert float(metrics["loss"]) > 0
+
+    def test_validation_without_augmentation(self):
+        """§11.10: validation remains without augmentation."""
+        net = create_model(backbone_weights=None)
+        trainer = DocCornerNetV2Trainer(net, bins=224, sigma_px=2.0, tau=0.5)
+        trainer.compile(
+            optimizer=keras.optimizers.AdamW(learning_rate=2e-4, weight_decay=1e-4)
+        )
+
+        B = 2
+        images = np.random.randn(B, 224, 224, 3).astype(np.float32)
+        coords = np.random.uniform(0.1, 0.9, (B, 8)).astype(np.float32)
+        has_doc = np.array([1.0, 0.0], dtype=np.float32)
+
+        # Validation path: no augmentation, just test_step
+        import tensorflow as tf
+        targets = {"coords": tf.constant(coords), "has_doc": tf.constant(has_doc)}
+        result, _, _ = trainer.test_step((tf.constant(images), targets))
+        assert float(result["loss"]) > 0
+        # Verify coords pass through unmodified
+        np.testing.assert_allclose(
+            targets["coords"].numpy(), coords, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Delayed augmentation activation tests
+# ---------------------------------------------------------------------------
+
+class TestDelayedAugmentation:
+    """Tests for --aug_start_epoch and --aug_min_iou logic."""
+
+    def test_defaults_immediate_activation(self):
+        """aug_start_epoch=1, aug_min_iou=0.0 -> active from epoch 1."""
+        assert should_activate_augmentation(epoch=1, best_iou=0.0,
+                                            aug_start_epoch=1, aug_min_iou=0.0)
+
+    def test_aug_start_epoch_delays_activation(self):
+        """Augmentation inactive before start epoch, active at start epoch."""
+        assert not should_activate_augmentation(epoch=1, best_iou=0.0,
+                                                aug_start_epoch=3, aug_min_iou=0.0)
+        assert not should_activate_augmentation(epoch=2, best_iou=0.5,
+                                                aug_start_epoch=3, aug_min_iou=0.0)
+        assert should_activate_augmentation(epoch=3, best_iou=0.5,
+                                            aug_start_epoch=3, aug_min_iou=0.0)
+        assert should_activate_augmentation(epoch=10, best_iou=0.9,
+                                            aug_start_epoch=3, aug_min_iou=0.0)
+
+    def test_aug_min_iou_delays_activation(self):
+        """Augmentation inactive until best_iou reaches threshold."""
+        assert not should_activate_augmentation(epoch=1, best_iou=0.0,
+                                                aug_start_epoch=1, aug_min_iou=0.5)
+        assert not should_activate_augmentation(epoch=5, best_iou=0.49,
+                                                aug_start_epoch=1, aug_min_iou=0.5)
+        assert should_activate_augmentation(epoch=5, best_iou=0.5,
+                                            aug_start_epoch=1, aug_min_iou=0.5)
+        assert should_activate_augmentation(epoch=10, best_iou=0.9,
+                                            aug_start_epoch=1, aug_min_iou=0.5)
+
+    def test_and_logic_both_conditions_required(self):
+        """Both epoch AND IoU conditions must be met (AND logic)."""
+        # Epoch met but IoU not met
+        assert not should_activate_augmentation(epoch=5, best_iou=0.3,
+                                                aug_start_epoch=3, aug_min_iou=0.5)
+        # IoU met but epoch not met
+        assert not should_activate_augmentation(epoch=2, best_iou=0.8,
+                                                aug_start_epoch=3, aug_min_iou=0.5)
+        # Both met
+        assert should_activate_augmentation(epoch=5, best_iou=0.8,
+                                            aug_start_epoch=3, aug_min_iou=0.5)
+
+    def test_exact_boundary_values(self):
+        """Activation at exact boundary (>=, not >)."""
+        assert should_activate_augmentation(epoch=3, best_iou=0.5,
+                                            aug_start_epoch=3, aug_min_iou=0.5)
+
+    def test_latch_behavior_simulation(self):
+        """Once activated, aug_active stays True even if IoU drops.
+
+        This tests the latch pattern used in train_ultra.py:
+        aug_active is only set to True, never back to False.
+        """
+        aug_active = False
+        iou_sequence = [0.0, 0.3, 0.6, 0.4, 0.35]  # IoU drops after epoch 3
+
+        for epoch, iou in enumerate(iou_sequence, start=1):
+            if not aug_active:
+                if should_activate_augmentation(epoch, iou,
+                                                aug_start_epoch=1, aug_min_iou=0.5):
+                    aug_active = True
+
+        # Should have activated at epoch 3 (iou=0.6 >= 0.5) and stayed active
+        assert aug_active
+
+    def test_never_activates_if_iou_stays_low(self):
+        """If IoU never reaches threshold, augmentation never activates."""
+        aug_active = False
+        for epoch in range(1, 11):
+            if not aug_active:
+                if should_activate_augmentation(epoch, best_iou=0.1,
+                                                aug_start_epoch=1, aug_min_iou=0.5):
+                    aug_active = True
+        assert not aug_active
+
+    def test_weak_aug_interaction(self):
+        """Delayed start + weak aug: no_aug -> full_aug -> weak_aug sequence.
+
+        Simulates: epochs=10, aug_start_epoch=3, aug_weak_epochs=2
+        Expected: epoch 1-2 no aug, 3-8 full aug, 9-10 weak aug.
+        """
+        total_epochs = 10
+        aug_start_epoch = 3
+        aug_weak_epochs = 2
+        aug_min_iou = 0.0
+
+        aug_active = False
+        phases = []
+
+        for epoch in range(1, total_epochs + 1):
+            # Check activation (happens after validation in real code,
+            # but for first epoch with aug_min_iou=0 it activates immediately)
+            if not aug_active:
+                if should_activate_augmentation(epoch, best_iou=0.0,
+                                                aug_start_epoch=aug_start_epoch,
+                                                aug_min_iou=aug_min_iou):
+                    aug_active = True
+
+            use_weak = (aug_active and aug_weak_epochs > 0
+                        and epoch >= total_epochs - aug_weak_epochs + 1)
+
+            if not aug_active:
+                phases.append("none")
+            elif use_weak:
+                phases.append("weak")
+            else:
+                phases.append("full")
+
+        assert phases == [
+            "none", "none",                         # epoch 1-2: before start
+            "full", "full", "full", "full",         # epoch 3-8: full aug
+            "full", "full",
+            "weak", "weak",                         # epoch 9-10: weak aug
+        ]
 
 
 # ---------------------------------------------------------------------------

@@ -258,7 +258,7 @@ class TestTrainUltraEdgeCases:
         coords = np.zeros((N, 8), dtype=np.float32)
         has_doc = np.ones(N, dtype=np.float32)
         ds = make_tf_dataset(images, coords, has_doc, batch_size=2,
-                             shuffle=False, augment=False, image_norm="raw255")
+                             shuffle=False, image_norm="raw255")
         for batch_images, _ in ds.take(1):
             # raw255: should be 128.0
             np.testing.assert_allclose(batch_images.numpy()[0, 0, 0], [128, 128, 128], atol=1)
@@ -269,7 +269,7 @@ class TestTrainUltraEdgeCases:
         coords = np.zeros((N, 8), dtype=np.float32)
         has_doc = np.ones(N, dtype=np.float32)
         ds = make_tf_dataset(images, coords, has_doc, batch_size=3,
-                             shuffle=False, augment=False, drop_remainder=True)
+                             shuffle=False, drop_remainder=True)
         count = sum(1 for _ in ds)
         assert count == 1  # 5 / 3 = 1 full batch
 

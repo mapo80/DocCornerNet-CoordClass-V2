@@ -160,7 +160,7 @@ class TestMakeTfDatasetImageNet:
         coords = np.zeros((N, 8), dtype=np.float32)
         has_doc = np.ones(N, dtype=np.float32)
         ds = train_mod.make_tf_dataset(images, coords, has_doc, batch_size=N,
-                                       shuffle=False, augment=False, image_norm="imagenet")
+                                       shuffle=False, image_norm="imagenet")
         for batch_images, _ in ds.take(1):
             # With all-zero input: (0/255 - mean) / std
             pixel = batch_images.numpy()[0, 0, 0]

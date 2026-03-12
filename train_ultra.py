@@ -34,6 +34,8 @@ from dataset import (
     augment_sample,
     normalize_image,
     DEFAULT_AUG_CONFIG,
+    tf_augment_batch,
+    tf_augment_color_only,
 )
 from metrics import ValidationMetrics
 
@@ -235,10 +237,10 @@ def load_dataset_fast(data_root, split, img_size, num_workers=32):
 
 def make_tf_dataset(
     images, coords, has_doc,
-    batch_size, shuffle, augment, image_norm="imagenet",
+    batch_size, shuffle, image_norm="imagenet",
     drop_remainder=False,
 ):
-    """Build tf.data pipeline from numpy arrays."""
+    """Build tf.data pipeline from numpy arrays (no augmentation)."""
     # Normalize images to float32
     imgs_f = images.astype(np.float32)
     if image_norm == "imagenet":
@@ -341,7 +343,26 @@ def parse_args():
     parser.add_argument("--init_weights", type=str, default=None,
                         help="Path to initial weights for warm start")
 
+    # Augmentation
+    parser.add_argument("--augment", action="store_true",
+                        help="Enable data augmentation during training")
+    parser.add_argument("--rotation_range", type=float, default=5.0,
+                        help="Random rotation range in degrees (requires --augment)")
+    parser.add_argument("--scale_range", type=float, default=0.0,
+                        help="Random scale range (0.15 means 0.85x-1.15x, 0.0=disabled)")
+    parser.add_argument("--aug_weak_epochs", type=int, default=0,
+                        help="Final N epochs use color-only augmentation (0=disabled)")
+    parser.add_argument("--aug_start_epoch", type=int, default=1,
+                        help="Epoch from which augmentation can activate (1-based, default=1)")
+    parser.add_argument("--aug_min_iou", type=float, default=0.0,
+                        help="Min best_iou before augmentation activates (0.0=immediate)")
+
     return parser.parse_args()
+
+
+def should_activate_augmentation(epoch, best_iou, aug_start_epoch, aug_min_iou):
+    """Check if delayed augmentation conditions are met (AND logic)."""
+    return epoch >= aug_start_epoch and best_iou >= aug_min_iou
 
 
 # --------------------------------------------------------------------------
@@ -379,12 +400,12 @@ def main():
 
     train_ds = make_tf_dataset(
         train_images, train_coords, train_has_doc,
-        args.batch_size, shuffle=True, augment=True, image_norm=args.input_norm,
+        args.batch_size, shuffle=True, image_norm=args.input_norm,
         drop_remainder=True,
     )
     val_ds = make_tf_dataset(
         val_images, val_coords, val_has_doc,
-        args.batch_size, shuffle=False, augment=False, image_norm=args.input_norm,
+        args.batch_size, shuffle=False, image_norm=args.input_norm,
     )
 
     train_steps = n_train // args.batch_size
@@ -449,6 +470,27 @@ def main():
           f"w_simcc={args.w_simcc} w_coord={args.w_coord} w_score={args.w_score}")
     print(f"  Schedule: warmup={args.warmup_epochs}ep cosine wd={args.weight_decay}")
     print(f"  Steps:    {train_steps}/ep train, {val_steps}/ep val")
+    if args.augment:
+        print(f"  Augment:  rotation={args.rotation_range}\u00b0 scale={args.scale_range} "
+              f"weak_last={args.aug_weak_epochs}ep")
+        if args.aug_start_epoch > 1:
+            print(f"  Aug start epoch: {args.aug_start_epoch}")
+        if args.aug_min_iou > 0:
+            print(f"  Aug min IoU:     {args.aug_min_iou}")
+        # Check ImageProjectiveTransformV3 availability for rotation
+        if args.rotation_range > 0:
+            try:
+                _test = tf.zeros([1, 4, 4, 3])
+                _t = tf.constant([[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])
+                tf.raw_ops.ImageProjectiveTransformV3(
+                    images=_test, transforms=_t,
+                    output_shape=tf.constant([4, 4]),
+                    interpolation="BILINEAR", fill_mode="NEAREST", fill_value=0.0)
+            except Exception:
+                print("  WARNING: ImageProjectiveTransformV3 not available, disabling rotation")
+                args.rotation_range = 0.0
+    else:
+        print(f"  Augment:  DISABLED")
 
     # Training loop
     print(f"\n--- Training ---")
@@ -462,16 +504,43 @@ def main():
     log_rows = []
     total_t0 = time.time()
 
+    # Delayed augmentation activation
+    aug_active = args.augment and (args.aug_start_epoch <= 1 and args.aug_min_iou <= 0.0)
+
+    logged_weak = False
+
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
+
+        # Determine augmentation mode for this epoch
+        use_weak_aug = (args.augment and args.aug_weak_epochs > 0
+                        and epoch >= args.epochs - args.aug_weak_epochs + 1)
+        if use_weak_aug and not logged_weak:
+            print(f"  -> Switching to weak augmentation (color only) "
+                  f"for final {args.aug_weak_epochs} epochs")
+            logged_weak = True
 
         # Train
         trainer.reset_metrics()
         train_pbar = tqdm(train_ds, total=train_steps,
                           desc=f"  Epoch {epoch}/{args.epochs} [Train]",
                           leave=False, ncols=100)
-        for batch in train_pbar:
-            trainer.train_step(batch)
+        for images, targets in train_pbar:
+            if aug_active:
+                coords = targets["coords"]
+                has_doc = targets["has_doc"]
+                if use_weak_aug:
+                    images = tf_augment_color_only(images, image_norm=args.input_norm)
+                else:
+                    images, coords = tf_augment_batch(
+                        images, coords, has_doc,
+                        img_size=args.img_size,
+                        image_norm=args.input_norm,
+                        rotation_range=args.rotation_range,
+                        scale_range=args.scale_range,
+                    )
+                targets = {"coords": coords, "has_doc": has_doc}
+            trainer.train_step((images, targets))
             train_pbar.set_postfix(loss=f"{float(trainer.loss_tracker.result()):.4f}")
         train_pbar.close()
         train_m = {k: float(v) for k, v in trainer._get_metrics_dict().items()}
@@ -512,6 +581,14 @@ def main():
             net.save_weights(str(output_dir / "best_model.weights.h5"))
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+
+        # Check delayed augmentation activation
+        if args.augment and not aug_active:
+            if should_activate_augmentation(epoch, best_iou,
+                                            args.aug_start_epoch, args.aug_min_iou):
+                aug_active = True
+                print(f"  -> Augmentation activated at epoch {epoch} "
+                      f"(best_iou={best_iou:.4f})")
 
         # ETA
         elapsed = time.time() - total_t0

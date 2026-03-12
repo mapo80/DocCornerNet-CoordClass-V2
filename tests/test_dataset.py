@@ -143,15 +143,13 @@ class TestAugmentSample:
         img_out, coords_out = augment_sample(img, coords)
         assert img_out.shape == (224, 224, 3)
         assert coords_out.shape == (8,)
-        assert coords_out.min() >= 0.0
-        assert coords_out.max() <= 1.0
+        # Option B: augment_sample no longer modifies coordinates
+        np.testing.assert_allclose(coords_out, coords, atol=1e-5)
 
     def test_no_augment_config(self):
         img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
         coords = np.array([0.3, 0.3, 0.7, 0.3, 0.7, 0.7, 0.3, 0.7], dtype=np.float32)
         config = {
-            "rotation_degrees": 0,
-            "scale_range": (1.0, 1.0),
             "brightness": 0.0,
             "contrast": 0.0,
             "saturation": 0.0,
