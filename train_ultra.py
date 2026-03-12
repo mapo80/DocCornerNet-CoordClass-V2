@@ -580,9 +580,10 @@ def main():
               f"  mean={val_err:.2f}px"
               f"  p95={detailed['corner_error_p95_px']:.2f}px"
               f"  max={detailed['corner_error_max_px']:.2f}px")
-        print(f"  |- Recall     @90={detailed['recall_90']*100:.0f}%"
-              f"  @95={detailed['recall_95']*100:.0f}%"
-              f"  @99={detailed['recall_99']*100:.0f}%")
+        print(f"  |- Recall     @50={detailed['recall_50']*100:.0f}%"
+              f"  @75={detailed['recall_75']*100:.0f}%"
+              f"  @90={detailed['recall_90']*100:.0f}%"
+              f"  @95={detailed['recall_95']*100:.0f}%")
         print(f"  |- Score      cls_f1={detailed['cls_f1']*100:.0f}%"
               f"  acc={detailed['cls_accuracy']*100:.0f}%")
         print(f"  '- LR         {lr_now:.2e}{_lr_delta(lr_now, prev_lr)}")
