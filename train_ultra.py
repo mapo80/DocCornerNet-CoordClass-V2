@@ -569,14 +569,18 @@ def main():
         iou_line = (f"  |- IoU        train={train_m['iou']:.4f}"
                     f"       val={iou:.4f}"
                     f"{_delta_str(iou, prev_iou, lower_is_better=False)}"
+                    f"  med={detailed['median_iou']:.4f}"
                     f"  best={best_iou:.4f}")
         if is_best_iou:
             iou_line += " ★ NEW BEST"
         print(iou_line)
         print(f"  |- Error      train={train_m['corner_err_px']:.2f}px"
               f"      val={val_err:.2f}px"
-              f"{_delta_str_px(val_err, prev_err)}"
-              f"  p95={detailed['corner_error_p95_px']:.2f}px")
+              f"{_delta_str_px(val_err, prev_err)}")
+        print(f"  |             min={detailed['corner_error_min_px']:.2f}px"
+              f"  mean={val_err:.2f}px"
+              f"  p95={detailed['corner_error_p95_px']:.2f}px"
+              f"  max={detailed['corner_error_max_px']:.2f}px")
         print(f"  |- Recall     @90={detailed['recall_90']*100:.0f}%"
               f"  @95={detailed['recall_95']*100:.0f}%"
               f"  @99={detailed['recall_99']*100:.0f}%")
