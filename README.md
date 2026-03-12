@@ -192,6 +192,10 @@ runs/v2_experiment/
 
 ## Evaluation
 
+Loads a trained model, runs inference on a dataset split (val or test), and reports geometry metrics (IoU, corner error, recall) and classification metrics (accuracy, F1). Automatically reads `config.json` from the model directory to reconstruct the architecture.
+
+Evaluate on validation set:
+
 ```bash
 python -m evaluate \
     --model_path runs/v2_experiment \
@@ -200,9 +204,76 @@ python -m evaluate \
     --batch_size 32
 ```
 
-Reports: mean/median IoU, corner error (min, mean, p95, max), recall@50/75/90/95, classification accuracy/F1.
+Evaluate on test set:
+
+```bash
+python -m evaluate \
+    --model_path runs/v2_experiment \
+    --data_root /path/to/dataset \
+    --split test
+```
+
+Evaluate a specific weights file:
+
+```bash
+python -m evaluate \
+    --model_path runs/v2_experiment/best_model.weights.h5 \
+    --data_root /path/to/dataset \
+    --split val
+```
+
+### Evaluation Arguments
+
+| Argument | Default | Description | Notes |
+|---|---|---|---|
+| `--model_path` | (required) | Path to model directory or `.weights.h5` file | If directory, auto-loads `config.json` + `best_model.weights.h5` |
+| `--data_root` | (required) | Dataset root directory | Same format as training (parquet or file-based) |
+| `--split` | `val` | Dataset split to evaluate | `train`, `val`, or `test` |
+| `--batch_size` | `32` | Batch size for inference | Increase for faster evaluation on GPU |
+| `--input_norm` | `imagenet` | Input normalization | Must match the normalization used during training |
+
+**Model config overrides** (only needed if `config.json` is not available):
+
+| Argument | Default | Description |
+|---|---|---|
+| `--alpha` | `0.35` | MobileNetV2 width multiplier |
+| `--fpn_ch` | `32` | FPN feature channels |
+| `--simcc_ch` | `96` | SimCC hidden channels |
+| `--img_size` | `224` | Input image size |
+| `--num_bins` | `224` | SimCC coordinate bins |
+| `--tau` | `1.0` | Soft-argmax temperature |
+
+### Evaluation Output
+
+```
+Geometry Metrics (on N images with documents):
+  Mean IoU:             0.8748
+  Median IoU:           0.8974
+  Corner Error (mean):  7.12 px
+  Corner Error (p95):   25.08 px
+  Recall@90:            48.4%
+  Recall@95:            11.5%
+  Recall@99:            0.2%
+
+Classification Metrics (on M total images):
+  Accuracy:             99.8%
+  F1 Score:             99.9%
+
+Targets: IoU >= 99%: 87.48% [FAIL] | Error <= 1px: 7.12px [FAIL]
+```
+
+| Metric | Description |
+|---|---|
+| Mean/Median IoU | Polygon IoU between predicted and ground truth document corners |
+| Corner Error | Mean Euclidean distance between predicted and GT corners in pixels |
+| Corner Error p95 | 95th percentile of corner error (worst-case indicator) |
+| Recall@90/95/99 | Fraction of samples with IoU above 90%/95%/99% |
+| Accuracy/F1 | Document presence classification metrics |
+| Targets | Pass/fail against production-quality thresholds (IoU >= 99%, error <= 1px) |
 
 ## Export
+
+Converts a trained model to deployment formats (SavedModel, TFLite float32, TFLite int8, ONNX). Reads `config.json` from the weights directory to reconstruct the architecture automatically.
 
 TFLite float32:
 
@@ -231,6 +302,35 @@ python -m export \
     --output_dir exported \
     --format savedmodel tflite
 ```
+
+### Export Arguments
+
+| Argument | Default | Description | Notes |
+|---|---|---|---|
+| `--weights` | (required) | Path to model directory or `.weights.h5` file | If directory, auto-loads `config.json` + `best_model.weights.h5` |
+| `--output_dir` | `./exported_v2` | Output directory for exported models | Created automatically if missing |
+| `--format` | `savedmodel tflite` | Export format(s) | One or more of: `savedmodel`, `tflite`, `tflite_int8`, `onnx`. Multiple formats can be specified |
+| `--representative_data` | `None` | Path to images directory for int8 calibration | Required only for `tflite_int8`. Uses ~100 images to determine quantization ranges |
+
+**Model config overrides** (only needed if `config.json` is not available):
+
+| Argument | Default | Description |
+|---|---|---|
+| `--alpha` | `0.35` | MobileNetV2 width multiplier |
+| `--fpn_ch` | `32` | FPN feature channels |
+| `--simcc_ch` | `96` | SimCC hidden channels |
+| `--img_size` | `224` | Input image size |
+| `--num_bins` | `224` | SimCC coordinate bins |
+| `--tau` | `1.0` | Soft-argmax temperature |
+
+### Export Formats
+
+| Format | File | Size (~) | Use case |
+|---|---|---|---|
+| `savedmodel` | `saved_model/` | ~2 MB | TF Serving, Python inference |
+| `tflite` | `model.tflite` | ~600 KB | Mobile/edge (float32) |
+| `tflite_int8` | `model_int8.tflite` | ~200 KB | Mobile/edge (quantized, fastest) |
+| `onnx` | `model.onnx` | ~2 MB | Cross-framework inference |
 
 ## Tests
 
