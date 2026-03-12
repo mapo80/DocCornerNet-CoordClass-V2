@@ -177,8 +177,10 @@ class TestDocCornerNetV2Trainer:
 
     def test_test_step(self, trainer):
         x, y = self._make_batch()
-        metrics = trainer.test_step((x, y))
+        metrics, out_coords, out_score_logit = trainer.test_step((x, y))
         assert "loss" in metrics
+        assert out_coords.shape[-1] == 8
+        assert out_score_logit.shape[-1] == 1
 
     def test_call(self, trainer):
         x = np.random.randn(2, 224, 224, 3).astype(np.float32)
@@ -195,7 +197,7 @@ class TestDocCornerNetV2Trainer:
             "has_doc": np.zeros(B, dtype=np.float32),
             "coords": np.zeros((B, 8), dtype=np.float32),
         }
-        metrics = trainer.test_step((x, y))
+        metrics, _, _ = trainer.test_step((x, y))
         assert "loss" in metrics
 
     def test_has_doc_2d(self, trainer):
@@ -206,7 +208,7 @@ class TestDocCornerNetV2Trainer:
             "has_doc": np.array([[1], [1], [0], [1]], dtype=np.float32),
             "coords": np.random.uniform(0.1, 0.9, (B, 8)).astype(np.float32),
         }
-        metrics = trainer.test_step((x, y))
+        metrics, _, _ = trainer.test_step((x, y))
         assert "loss" in metrics
 
     def test_geometry_metrics_computation(self, trainer):

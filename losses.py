@@ -218,33 +218,40 @@ class DocCornerNetV2Trainer(keras.Model):
             "corner_err_px": self.corner_err_tracker.result(),
         }
 
-    def train_step(self, data):
-        x, y = data
-        has_doc, coords_gt = self._extract_targets(y)
-
+    @tf.function
+    def _compiled_train_body(self, x, has_doc, coords_gt):
         with tf.GradientTape() as tape:
             outputs = self.net(x, training=True)
             loss, loss_simcc, loss_coord, loss_score, coords_pred = self._compute_losses(
                 outputs, has_doc, coords_gt,
             )
-
         grads = tape.gradient(loss, self.net.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.net.trainable_variables))
+        return loss, loss_simcc, loss_coord, loss_score, coords_pred
 
+    @tf.function
+    def _compiled_test_body(self, x, has_doc, coords_gt):
+        outputs = self.net(x, training=False)
+        loss, loss_simcc, loss_coord, loss_score, coords_pred = self._compute_losses(
+            outputs, has_doc, coords_gt,
+        )
+        return loss, loss_simcc, loss_coord, loss_score, coords_pred, outputs["coords"], outputs["score_logit"]
+
+    def train_step(self, data):
+        x, y = data
+        has_doc, coords_gt = self._extract_targets(y)
+        loss, loss_simcc, loss_coord, loss_score, coords_pred = self._compiled_train_body(x, has_doc, coords_gt)
         self._update_metrics(loss, loss_simcc, loss_coord, loss_score, coords_pred, coords_gt, has_doc)
         return self._get_metrics_dict()
 
     def test_step(self, data):
         x, y = data
         has_doc, coords_gt = self._extract_targets(y)
-
-        outputs = self.net(x, training=False)
-        loss, loss_simcc, loss_coord, loss_score, coords_pred = self._compute_losses(
-            outputs, has_doc, coords_gt,
+        loss, loss_simcc, loss_coord, loss_score, coords_pred, out_coords, out_score_logit = (
+            self._compiled_test_body(x, has_doc, coords_gt)
         )
-
         self._update_metrics(loss, loss_simcc, loss_coord, loss_score, coords_pred, coords_gt, has_doc)
-        return self._get_metrics_dict()
+        return self._get_metrics_dict(), out_coords, out_score_logit
 
     def _compute_geometry_metrics(self, pred_coords, gt_coords, mask):
         """Simplified bbox IoU and corner error for positive samples."""

@@ -483,10 +483,9 @@ def main():
                         desc=f"  Epoch {epoch}/{args.epochs} [Val]  ",
                         leave=False, ncols=100)
         for images, targets in val_pbar:
-            trainer.test_step((images, targets))
-            outputs = net(images, training=False)
-            coords_pred = outputs["coords"].numpy()
-            score_logit = outputs["score_logit"].numpy()
+            val_result, coords_pred_t, score_logit_t = trainer.test_step((images, targets))
+            coords_pred = coords_pred_t.numpy()
+            score_logit = score_logit_t.numpy()
             score_pred = 1.0 / (1.0 + np.exp(-np.clip(score_logit, -60.0, 60.0)))
             val_metrics.update(
                 coords_pred, targets["coords"].numpy(),
