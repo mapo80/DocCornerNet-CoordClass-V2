@@ -110,9 +110,27 @@ def _load_single_image(args):
         return None
 
 
-def load_dataset_parquet(data_root, split, img_size):
-    """Load dataset from parquet files (HuggingFace format)."""
+def _decode_parquet_row(args):
+    """Thread-safe: decode a single parquet row (JPEG bytes → resized numpy)."""
     import io
+    img_bytes, is_neg, coord_values, img_size = args
+    try:
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img = img.resize((img_size, img_size), Image.BILINEAR)
+        img_array = np.asarray(img, dtype=np.uint8).copy()
+        if is_neg:
+            coords = np.zeros(8, dtype=np.float32)
+            has_doc = 0.0
+        else:
+            coords = np.array(coord_values, dtype=np.float32)
+            has_doc = 1.0 if coords.sum() > 0 else 0.0
+        return (img_array, coords, has_doc)
+    except Exception:
+        return None
+
+
+def load_dataset_parquet(data_root, split, img_size, num_workers=16):
+    """Load dataset from parquet files (HuggingFace format) with threaded decoding."""
     import pyarrow.parquet as pq
 
     split_dir = Path(data_root) / split
@@ -124,40 +142,40 @@ def load_dataset_parquet(data_root, split, img_size):
     n_images = table.num_rows
     print(f"Loading {split}: {n_images} images from {len(parquet_files)} parquet file(s)", flush=True)
 
-    images = np.empty((n_images, img_size, img_size, 3), dtype=np.uint8)
-    coords = np.empty((n_images, 8), dtype=np.float32)
-    has_doc = np.empty(n_images, dtype=np.float32)
-
+    # Pre-extract all data from pyarrow (fast, single-thread)
     img_col = table.column("image")
     is_neg_col = table.column("is_negative")
     coord_cols = ["corner_tl_x", "corner_tl_y", "corner_tr_x", "corner_tr_y",
                   "corner_br_x", "corner_br_y", "corner_bl_x", "corner_bl_y"]
 
-    n_valid = 0
-    for i in tqdm(range(n_images), desc=f"  Loading {split}", ncols=80, leave=True):
-        try:
-            img_struct = img_col[i].as_py()
-            img_bytes = img_struct["bytes"]
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            img = img.resize((img_size, img_size), Image.BILINEAR)
-            images[n_valid] = np.asarray(img, dtype=np.uint8)
+    args_list = []
+    for i in range(n_images):
+        img_bytes = img_col[i].as_py()["bytes"]
+        is_neg = is_neg_col[i].as_py()
+        coord_values = [table.column(cn)[i].as_py() for cn in coord_cols]
+        args_list.append((img_bytes, is_neg, coord_values, img_size))
 
-            is_neg = is_neg_col[i].as_py()
-            if is_neg:
-                coords[n_valid] = 0.0
-                has_doc[n_valid] = 0.0
-            else:
-                c = np.array([table.column(cn)[i].as_py() for cn in coord_cols], dtype=np.float32)
-                coords[n_valid] = c
-                has_doc[n_valid] = 1.0 if c.sum() > 0 else 0.0
+    # Parallel JPEG decode + resize
+    results = []
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        for result in tqdm(executor.map(_decode_parquet_row, args_list),
+                           total=n_images, desc=f"  Decoding {split}",
+                           ncols=80, leave=True):
+            if result is not None:
+                results.append(result)
 
-            n_valid += 1
-        except Exception:
-            continue
+    n_valid = len(results)
+    images = np.empty((n_valid, img_size, img_size, 3), dtype=np.uint8)
+    coords = np.empty((n_valid, 8), dtype=np.float32)
+    has_doc = np.empty(n_valid, dtype=np.float32)
 
-    images = images[:n_valid]
-    coords = coords[:n_valid]
-    has_doc = has_doc[:n_valid]
+    for i, (img, c, h) in enumerate(results):
+        images[i] = img
+        coords[i] = c
+        has_doc[i] = h
+
+    del results
+    gc.collect()
     print(f"  {n_valid}/{n_images} valid ({int((has_doc == 1).sum())} pos, {int((has_doc == 0).sum())} neg)", flush=True)
     return images, coords, has_doc
 
@@ -169,7 +187,7 @@ def load_dataset_fast(data_root, split, img_size, num_workers=32):
     # Check for parquet format first
     split_dir = data_root / split
     if split_dir.is_dir() and any(split_dir.glob("*.parquet")):
-        return load_dataset_parquet(data_root, split, img_size)
+        return load_dataset_parquet(data_root, split, img_size, num_workers=num_workers)
 
     # Fall back to file-based format
     split_file = data_root / f"{split}.txt"
@@ -489,7 +507,7 @@ def main():
             lr_now = float(args.learning_rate)
 
         # Track bests
-        is_best_iou = iou > best_iou
+        is_best_iou = iou > best_iou and iou > 0
         if is_best_iou:
             best_iou = iou
             net.save_weights(str(output_dir / "best_model.weights.h5"))
