@@ -584,6 +584,15 @@ def main():
               f"  @75={detailed['recall_75']*100:.2f}%"
               f"  @90={detailed['recall_90']*100:.2f}%"
               f"  @95={detailed['recall_95']*100:.2f}%")
+        n_doc = detailed['num_with_doc']
+        if n_doc > 0:
+            _pct = lambda v: f"{v/n_doc*100:.1f}%"
+            print(f"  |- Outliers   IoU<.90={detailed['num_iou_lt_90']}/{n_doc} ({_pct(detailed['num_iou_lt_90'])})"
+                  f"  <.95={detailed['num_iou_lt_95']}/{n_doc} ({_pct(detailed['num_iou_lt_95'])})"
+                  f"  <.99={detailed['num_iou_lt_99']}/{n_doc} ({_pct(detailed['num_iou_lt_99'])})")
+            print(f"  |             err>10px={detailed['num_err_gt_10']}/{n_doc} ({_pct(detailed['num_err_gt_10'])})"
+                  f"  >20px={detailed['num_err_gt_20']}/{n_doc} ({_pct(detailed['num_err_gt_20'])})"
+                  f"  >50px={detailed['num_err_gt_50']}/{n_doc} ({_pct(detailed['num_err_gt_50'])})")
         print(f"  |- Score      f1={detailed['cls_f1']*100:.2f}%"
               f"  prec={detailed['cls_precision']*100:.2f}%"
               f"  rec={detailed['cls_recall']*100:.2f}%"
