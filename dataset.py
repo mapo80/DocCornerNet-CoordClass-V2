@@ -183,25 +183,26 @@ def _tf_rotate_batch(images, coords, has_doc, rotation_range):
 
 
 def _tf_scale_batch(images, coords, has_doc, scale_range):
-    """Apply random scale augmentation to batch.
+    """Apply random scale augmentation to batch (zoom-out only).
 
-    Scale range 0.15 means uniform scale in [0.85, 1.15].
-    Zoom-in (>1): center crop + resize. Zoom-out (<1): shrink + pad.
-    Coordinates: coords_new = 0.5 + (coords - 0.5) / scale.
+    Scale range 0.15 means uniform scale in [0.85, 1.0].
+    Zoom-out (<1): the document appears smaller, corners move toward center.
+    Coordinates: coords_new = 0.5 + (coords - 0.5) * scale.
     Samples where any coord goes outside [0,1] are left unchanged.
     """
     batch_size = tf.shape(images)[0]
     h = tf.cast(tf.shape(images)[1], tf.float32)
     w = tf.cast(tf.shape(images)[2], tf.float32)
 
-    # Random scale per sample
-    scales = tf.random.uniform([batch_size], 1.0 - scale_range, 1.0 + scale_range)
+    # Random scale per sample (zoom-out only: scale in [1-range, 1.0])
+    scales = tf.random.uniform([batch_size], 1.0 - scale_range, 1.0)
 
     has_doc_1d = tf.cast(tf.reshape(has_doc > 0.5, [batch_size]), tf.float32)
 
     # Transform coordinates: zoom around center
+    # crop_and_resize maps input p to output: 0.5 + scale * (p - 0.5)
     coords_4x2 = tf.reshape(coords, [-1, 4, 2])
-    new_coords_4x2 = 0.5 + (coords_4x2 - 0.5) / scales[:, None, None]
+    new_coords_4x2 = 0.5 + (coords_4x2 - 0.5) * scales[:, None, None]
     new_coords = tf.reshape(new_coords_4x2, [-1, 8])
 
     # Check if any coord goes OOB — if so, skip transform for that sample
