@@ -102,6 +102,7 @@ class TestTrainParseArgs:
             assert args.data_root == "/tmp/d"
             assert args.epochs == 100
             assert args.batch_size == 32
+            assert args.aug_factor == 1
 
     def test_parse_args_custom(self):
         with patch("sys.argv", [
@@ -111,11 +112,14 @@ class TestTrainParseArgs:
             "--loss_tau", "0.1", "--w_coord", "0.5",
             "--init_weights", "/tmp/w.h5",
             "--backbone_weights", "none",
+            "--augment",
+            "--aug_factor", "3",
         ]):
             args = train_mod.parse_args()
             assert args.epochs == 5
             assert args.sigma_px == 3.0
             assert args.init_weights == "/tmp/w.h5"
+            assert args.aug_factor == 3
 
 
 class TestTrainSetupPlatform:

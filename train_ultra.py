@@ -249,20 +249,27 @@ def _normalize_image(image, image_norm):
 
 def make_tf_dataset(
     images, coords, has_doc,
-    batch_size, shuffle, image_norm="imagenet",
+    batch_size, shuffle, augment=False, image_norm="imagenet",
     drop_remainder=False,
+    repeat_forever=False,
 ):
     """Build tf.data pipeline from numpy arrays (no augmentation).
 
     Images are kept as uint8 and normalized lazily per-batch to avoid
     allocating a full float32 copy of the dataset in memory.
     """
+    del augment  # Batch augmentation happens in the training loop.
     ds = tf.data.Dataset.from_tensor_slices((
         images,  # keep uint8, normalize lazily
         {"coords": coords, "has_doc": has_doc},
     ))
     if shuffle:
-        ds = ds.shuffle(buffer_size=min(len(images), 10000))
+        ds = ds.shuffle(
+            buffer_size=min(len(images), 10000),
+            reshuffle_each_iteration=True,
+        )
+    if repeat_forever:
+        ds = ds.repeat()
     ds = ds.batch(batch_size, drop_remainder=drop_remainder)
     ds = ds.map(
         lambda img, tgt: (_normalize_image(img, image_norm), tgt),
@@ -360,13 +367,15 @@ def parse_args():
     parser.add_argument("--rotation_range", type=float, default=5.0,
                         help="Random rotation range in degrees (requires --augment)")
     parser.add_argument("--scale_range", type=float, default=0.0,
-                        help="Random scale range (0.15 means 0.85x-1.15x, 0.0=disabled)")
+                        help="Random scale range (0.15 means 0.85x-1.0x, 0.0=disabled)")
     parser.add_argument("--aug_weak_epochs", type=int, default=0,
                         help="Final N epochs use color-only augmentation (0=disabled)")
     parser.add_argument("--aug_start_epoch", type=int, default=1,
                         help="Epoch from which augmentation can activate (1-based, default=1)")
     parser.add_argument("--aug_min_iou", type=float, default=0.0,
                         help="Min best_iou before augmentation activates (0.0=immediate)")
+    parser.add_argument("--aug_factor", type=int, default=1,
+                        help="Virtual train multiplier via repeated stochastic views per epoch (1=default)")
 
     return parser.parse_args()
 
@@ -376,12 +385,32 @@ def should_activate_augmentation(epoch, best_iou, aug_start_epoch, aug_min_iou):
     return epoch >= aug_start_epoch and best_iou >= aug_min_iou
 
 
+def resolve_effective_aug_factor(args):
+    """Validate augmentation-factor constraints and return the effective factor."""
+    if args.aug_factor < 1:
+        raise ValueError("--aug_factor must be >= 1")
+
+    if not args.augment:
+        if args.aug_factor > 1:
+            raise ValueError("--aug_factor > 1 requires --augment")
+        return 1
+
+    if args.aug_factor > 1:
+        if args.aug_start_epoch != 1:
+            raise ValueError("--aug_factor > 1 requires --aug_start_epoch 1")
+        if args.aug_min_iou > 0.0:
+            raise ValueError("--aug_factor > 1 requires --aug_min_iou 0.0")
+
+    return args.aug_factor
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
 def main():
     args = parse_args()
+    effective_aug_factor = resolve_effective_aug_factor(args)
     platform = setup_platform()
 
     output_dir = Path(args.output_dir)
@@ -408,12 +437,17 @@ def main():
 
     n_train = len(train_images)
     n_val = len(val_images)
+    base_train_steps = n_train // args.batch_size
+    train_steps = base_train_steps * effective_aug_factor
+    val_steps = math.ceil(n_val / args.batch_size)
+    repeat_train = effective_aug_factor > 1
 
     print(f"Creating train dataset ({n_train} images)...", end=" ", flush=True)
     train_ds = make_tf_dataset(
         train_images, train_coords, train_has_doc,
         args.batch_size, shuffle=True, image_norm=args.input_norm,
         drop_remainder=True,
+        repeat_forever=repeat_train,
     )
     print("done", flush=True)
 
@@ -421,11 +455,9 @@ def main():
     val_ds = make_tf_dataset(
         val_images, val_coords, val_has_doc,
         args.batch_size, shuffle=False, image_norm=args.input_norm,
+        repeat_forever=False,
     )
     print("done", flush=True)
-
-    train_steps = n_train // args.batch_size
-    val_steps = math.ceil(n_val / args.batch_size)
 
     # Build model
     bw = args.backbone_weights
@@ -468,7 +500,7 @@ def main():
     )
 
     # Optimizer with cosine schedule
-    steps_per_epoch = len(train_images) // args.batch_size
+    steps_per_epoch = train_steps
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = steps_per_epoch * args.warmup_epochs
 
@@ -492,6 +524,11 @@ def main():
     print(f"  Loss:     sigma_px={args.sigma_px} loss_tau={args.loss_tau} "
           f"w_simcc={args.w_simcc} w_coord={args.w_coord} w_score={args.w_score}")
     print(f"  Schedule: warmup={args.warmup_epochs}ep cosine wd={args.weight_decay}")
+    if effective_aug_factor > 1:
+        print(f"  Aug factor: {effective_aug_factor}x "
+              f"(base_steps={base_train_steps}/ep -> effective_steps={train_steps}/ep)")
+    else:
+        print(f"  Aug factor: 1x (default)")
     print(f"  Steps:    {train_steps}/ep train, {val_steps}/ep val")
     if args.augment:
         print(f"  Augment:  rotation={args.rotation_range}\u00b0 scale={args.scale_range} "
@@ -545,7 +582,8 @@ def main():
 
         # Train
         trainer.reset_metrics()
-        train_pbar = tqdm(train_ds, total=train_steps,
+        epoch_ds = train_ds.take(train_steps) if repeat_train else train_ds
+        train_pbar = tqdm(epoch_ds, total=train_steps,
                           desc=f"  Epoch {epoch}/{args.epochs} [Train]",
                           leave=False, ncols=100)
         for images, targets in train_pbar:

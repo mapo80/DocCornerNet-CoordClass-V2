@@ -100,6 +100,7 @@ python -m train_ultra \
     --epochs 100 \
     --batch_size 32 \
     --augment \
+    --aug_factor 2 \
     --rotation_range 5.0 \
     --scale_range 0.0
 ```
@@ -125,6 +126,7 @@ python -m train_ultra \
     --backbone_weights imagenet \
     --num_workers 32 \
     --augment \
+    --aug_factor 2 \
     --rotation_range 5.0 \
     --scale_range 0.0 \
     --aug_weak_epochs 10
@@ -202,8 +204,9 @@ python -m train_ultra \
 | Argument | Default | Description | Notes |
 |---|---|---|---|
 | `--augment` | `false` | Enable data augmentation during training | Pass flag to activate. Augmentation is applied batch-wise in the training loop using TensorFlow ops (GPU-accelerated). Validation and test are never augmented |
+| `--aug_factor` | `1` | Virtual train multiplier via repeated stochastic views per epoch | `1` = default. `>1` makes each epoch consume more augmented batches from the same base dataset without writing anything to disk. In the current implementation it requires `--augment`, `--aug_start_epoch 1`, and `--aug_min_iou 0.0` |
 | `--rotation_range` | `5.0` | Random rotation range in degrees | Applied per sample, uniform in [-range, +range]. Requires `--augment`. Uses `ImageProjectiveTransformV3`; falls back to 0 if unavailable |
-| `--scale_range` | `0.0` | Random scale range | 0.15 means uniform scale in [0.85, 1.15]. Uses `crop_and_resize`. Start with 0.0, enable after smoke test on small dataset. Samples where coords go OOB are left unchanged |
+| `--scale_range` | `0.0` | Random scale range | 0.15 means uniform scale in [0.85, 1.0] in the current implementation (zoom-out only). Uses `crop_and_resize`. Start with 0.0, enable after smoke test on small dataset. Samples where coords go OOB are left unchanged |
 | `--aug_weak_epochs` | `0` | Final N epochs use color-only augmentation | 0 = disabled. When active, the last N epochs switch from full augmentation (geometric + photometric) to photometric only. Helps stabilize training precision in final phase |
 | `--aug_start_epoch` | `1` | Epoch from which augmentation can activate | 1 = immediate. Useful with `--init_weights` warm start to let the model stabilize before applying augmentation. Both `--aug_start_epoch` AND `--aug_min_iou` must be satisfied (AND logic) |
 | `--aug_min_iou` | `0.0` | Min best IoU before augmentation activates | 0.0 = immediate. Once activated, augmentation stays active for the rest of training (latch). Combined with `--aug_start_epoch` via AND logic |
@@ -226,11 +229,13 @@ When `--augment` is active, the following augmentations are applied batch-wise o
 |---|---|---|---|
 | Horizontal flip | 50% probability | Always on | Correctly remaps corner order: TL<->TR, BL<->BR, x -> 1-x |
 | Rotation | uniform [-range, +range] degrees | 5.0° | Image rotated via projective transform, coordinates via forward rotation matrix. Coords clipped to [0, 1] |
-| Scale | uniform [1-range, 1+range] | 0.0 (disabled) | Zoom via `crop_and_resize`. Samples where transformed coords exit [0, 1] are left unchanged |
+| Scale | uniform [1-range, 1.0] | 0.0 (disabled) | Zoom via `crop_and_resize` in the current implementation (zoom-out only). Samples where transformed coords exit [0, 1] are left unchanged |
 
 **Clipping**: images are clipped to the normalization range (imagenet: [-3, 3], zero_one: [0, 1], raw255: [0, 255]). Coordinates are always clipped to [0, 1].
 
 **Delayed activation** (`--aug_start_epoch` / `--aug_min_iou`): augmentation can be delayed until the model reaches a stable baseline. Both conditions must be met (AND logic). Once activated, augmentation stays active for the rest of training. Example: `--aug_start_epoch 3 --aug_min_iou 0.5` waits until epoch >= 3 AND best IoU >= 0.5.
+
+**Dataset multiplication without filesystem** (`--aug_factor > 1`): the train dataset is repeated in-memory via `tf.data.repeat()` and each epoch consumes more batches from the same base samples. The extra diversity comes from the existing on-the-fly batch augmentation, so no augmented images are ever saved to disk. In the current implementation this mode requires augmentation to be active from epoch 1 (`--augment --aug_start_epoch 1 --aug_min_iou 0.0`).
 
 **Weak augmentation** (`--aug_weak_epochs > 0`): in the final N epochs, geometric augmentations are disabled and only mild photometric augmentations are applied (brightness +-0.15, contrast [0.85, 1.15], saturation [0.85, 1.15]). This allows the model to refine precision on unperturbed geometry.
 

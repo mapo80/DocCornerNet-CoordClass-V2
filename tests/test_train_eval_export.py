@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,6 +18,7 @@ from metrics import ValidationMetrics
 from train_ultra import (
     WarmupCosineSchedule,
     make_tf_dataset,
+    resolve_effective_aug_factor,
     should_activate_augmentation,
 )
 from export import (
@@ -97,6 +99,75 @@ class TestMakeTfDataset:
         )
         for batch_images, _ in ds.take(1):
             np.testing.assert_allclose(batch_images.numpy(), 1.0, atol=1e-5)
+
+    def test_repeat_forever_reuses_samples(self):
+        N = 4
+        images = np.arange(N * 8 * 8 * 3, dtype=np.uint8).reshape(N, 8, 8, 3)
+        coords = np.zeros((N, 8), dtype=np.float32)
+        has_doc = np.ones(N, dtype=np.float32)
+
+        ds = make_tf_dataset(
+            images, coords, has_doc,
+            batch_size=2, shuffle=False,
+            repeat_forever=True,
+        )
+        batches = list(ds.take(3))
+        assert len(batches) == 3
+        np.testing.assert_allclose(
+            batches[0][0].numpy(),
+            batches[2][0].numpy(),
+            atol=1e-6,
+        )
+
+
+class TestResolveEffectiveAugFactor:
+    def test_default_factor(self):
+        args = SimpleNamespace(
+            augment=False,
+            aug_factor=1,
+            aug_start_epoch=1,
+            aug_min_iou=0.0,
+        )
+        assert resolve_effective_aug_factor(args) == 1
+
+    def test_requires_augment(self):
+        args = SimpleNamespace(
+            augment=False,
+            aug_factor=2,
+            aug_start_epoch=1,
+            aug_min_iou=0.0,
+        )
+        with pytest.raises(ValueError, match="requires --augment"):
+            resolve_effective_aug_factor(args)
+
+    def test_requires_immediate_start(self):
+        args = SimpleNamespace(
+            augment=True,
+            aug_factor=2,
+            aug_start_epoch=3,
+            aug_min_iou=0.0,
+        )
+        with pytest.raises(ValueError, match="requires --aug_start_epoch 1"):
+            resolve_effective_aug_factor(args)
+
+    def test_requires_zero_min_iou(self):
+        args = SimpleNamespace(
+            augment=True,
+            aug_factor=2,
+            aug_start_epoch=1,
+            aug_min_iou=0.5,
+        )
+        with pytest.raises(ValueError, match="requires --aug_min_iou 0.0"):
+            resolve_effective_aug_factor(args)
+
+    def test_accepts_valid_factor(self):
+        args = SimpleNamespace(
+            augment=True,
+            aug_factor=3,
+            aug_start_epoch=1,
+            aug_min_iou=0.0,
+        )
+        assert resolve_effective_aug_factor(args) == 3
 
 
 class TestTrainingSmoke:
