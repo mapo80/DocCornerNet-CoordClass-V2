@@ -8,9 +8,12 @@ from tensorflow import keras
 from model import (
     AxisMean,
     Broadcast1D,
+    HeatmapOffsetDecode,
+    HeatmapOffsetRefine,
     NearestUpsample2x,
     Resize1D,
     SimCCDecode,
+    SpatialReduceLogSumExp,
     build_doccorner_v2,
     create_inference_model,
     create_model,
@@ -181,6 +184,68 @@ class TestSimCCDecode:
         assert cfg["tau"] == 0.5
 
 
+class TestSpatialReduceLogSumExp:
+    def test_axis1_shape(self):
+        layer = SpatialReduceLogSumExp(axis=1)
+        x = tf.random.normal([2, 56, 56, 4])
+        out = layer(x)
+        assert out.shape == (2, 56, 4)
+
+    def test_axis2_shape(self):
+        layer = SpatialReduceLogSumExp(axis=2)
+        x = tf.random.normal([2, 56, 56, 4])
+        out = layer(x)
+        assert out.shape == (2, 56, 4)
+
+    def test_invalid_axis(self):
+        with pytest.raises(ValueError, match="axis must be 1 or 2"):
+            SpatialReduceLogSumExp(axis=0)
+
+
+class TestHeatmapOffsetDecode:
+    def test_shape(self):
+        layer = HeatmapOffsetDecode(tau=1.0, offset_scale=0.5)
+        hm = tf.random.normal([2, 56, 56, 4])
+        off = tf.random.normal([2, 56, 56, 8])
+        out = layer([hm, off])
+        assert out.shape == (2, 8)
+
+    def test_range(self):
+        layer = HeatmapOffsetDecode(tau=1.0, offset_scale=0.5)
+        hm = tf.random.normal([2, 56, 56, 4])
+        off = tf.random.normal([2, 56, 56, 8])
+        out = layer([hm, off]).numpy()
+        assert out.min() >= 0.0
+        assert out.max() <= 1.0
+
+    def test_peaked_distribution_near_center(self):
+        layer = HeatmapOffsetDecode(tau=0.01, offset_scale=0.5)
+        hm = np.full((1, 56, 56, 4), -100.0, dtype=np.float32)
+        hm[:, 28, 28, :] = 100.0
+        off = np.zeros((1, 56, 56, 8), dtype=np.float32)
+        out = layer([tf.constant(hm), tf.constant(off)]).numpy()
+        np.testing.assert_allclose(out, 0.5089, atol=0.03)
+
+
+class TestHeatmapOffsetRefine:
+    def test_shape(self):
+        layer = HeatmapOffsetRefine(tau=1.0, offset_scale=0.5)
+        coarse = tf.random.uniform([2, 8], 0.2, 0.8)
+        hm = tf.random.normal([2, 56, 56, 4])
+        off = tf.random.normal([2, 56, 56, 8])
+        out = layer([coarse, hm, off])
+        assert out.shape == (2, 8)
+
+    def test_range(self):
+        layer = HeatmapOffsetRefine(tau=1.0, offset_scale=0.5)
+        coarse = tf.fill([1, 8], 0.5)
+        hm = tf.zeros([1, 56, 56, 4])
+        off = tf.zeros([1, 56, 56, 8])
+        out = layer([coarse, hm, off]).numpy()
+        assert out.min() >= 0.0
+        assert out.max() <= 1.0
+
+
 # ---------------------------------------------------------------------------
 # Model construction tests
 # ---------------------------------------------------------------------------
@@ -206,6 +271,8 @@ class TestModelConstruction:
         out = model(x, training=False)
         assert "simcc_x" in out
         assert "simcc_y" in out
+        assert "corner_heatmap" in out
+        assert "corner_offset" in out
         assert "score_logit" in out
         assert "coords" in out
 
@@ -214,6 +281,8 @@ class TestModelConstruction:
         out = model(x, training=False)
         assert out["simcc_x"].shape == (2, 4, 224)
         assert out["simcc_y"].shape == (2, 4, 224)
+        assert out["corner_heatmap"].shape == (2, 56, 56, 4)
+        assert out["corner_offset"].shape == (2, 56, 56, 8)
         assert out["score_logit"].shape == (2, 1)
         assert out["coords"].shape == (2, 8)
 
@@ -298,6 +367,9 @@ class TestModelSerialization:
             Broadcast1D(target_length=224),
             NearestUpsample2x(),
             SimCCDecode(num_bins=224, tau=1.0),
+            SpatialReduceLogSumExp(axis=1),
+            HeatmapOffsetDecode(tau=1.0, offset_scale=0.5),
+            HeatmapOffsetRefine(tau=1.0, offset_scale=0.5),
         ]
         for layer in layers_to_test:
             cfg = layer.get_config()
@@ -360,10 +432,9 @@ class TestCornerAttention:
             assert any(f"att_{cn}_sigmoid" in n for n in layer_names), f"Missing att_{cn}_sigmoid"
             assert any(f"att_{cn}_mul" in n for n in layer_names), f"Missing att_{cn}_mul"
 
-    def test_shared_simcc_weights(self):
-        """SimCC Conv1D layers should be shared (same name, called 4 times)."""
+    def test_heatmap_and_offset_heads_exist(self):
         model = create_model(backbone_weights=None)
         layer_names = [l.name for l in model.layers]
-        # The shared layers should appear only once by name
-        assert layer_names.count("simcc_x_conv1") == 1
-        assert layer_names.count("simcc_y_conv1") == 1
+        for cn in ["tl", "tr", "br", "bl"]:
+            assert any(f"heatmap_{cn}_logit" in n for n in layer_names), f"Missing heatmap_{cn}_logit"
+            assert any(f"offset_{cn}_raw" in n for n in layer_names), f"Missing offset_{cn}_raw"

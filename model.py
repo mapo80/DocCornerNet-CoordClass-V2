@@ -5,17 +5,17 @@ Architecture:
 - Backbone: MobileNetV2 alpha=0.35 (224x224 input)
 - Neck: Mini-FPN top-down (C2/C3/C4 → P2 fused at 56x56)
 - Corner Attention: 4 lightweight spatial attention heads on shared precursor
-- Head: Per-corner SimCC 1D coordinate classification with shared Conv1D weights
+- Head: Direct per-corner SimCC coarse path + 2D heatmap/offset refinement
 - Score: Document presence from C5 global pool
-- Decode: Soft-argmax on per-corner logits → coords [B, 8]
+- Decode: SimCC coarse coords + heatmap-weighted local offsets → coords [B, 8]
 
 Output dict keys:
-  simcc_x:     [B, 4, num_bins]  X coordinate logits per corner
-  simcc_y:     [B, 4, num_bins]  Y coordinate logits per corner
-  score_logit: [B, 1]            Document presence logit
-  coords:      [B, 8]            Decoded normalized coordinates (x0,y0,...,x3,y3)
-
-Target: <1M parameters, IoU >= 0.99 at 224x224
+  simcc_x:        [B, 4, num_bins]   X marginal logits per corner
+  simcc_y:        [B, 4, num_bins]   Y marginal logits per corner
+  corner_heatmap: [B, 56, 56, 4]     Corner heatmap logits
+  corner_offset:  [B, 56, 56, 8]     Corner local offsets (dx,dy per corner)
+  score_logit:    [B, 1]             Document presence logit
+  coords:         [B, 8]             Decoded normalized coordinates
 """
 
 import numpy as np
@@ -171,6 +171,147 @@ class SimCCDecode(layers.Layer):
         return config
 
 
+@register_keras_serializable(package="doccorner_v2")
+class SpatialReduceLogSumExp(layers.Layer):
+    """Reduce a spatial axis of an NHWC tensor via log-sum-exp pooling."""
+
+    def __init__(self, axis: int, **kwargs):
+        super().__init__(**kwargs)
+        if axis not in (1, 2):
+            raise ValueError(f"SpatialReduceLogSumExp axis must be 1 or 2, got {axis}")
+        self.axis = int(axis)
+
+    def call(self, inputs):
+        return tf.reduce_logsumexp(inputs, axis=self.axis)
+
+    def get_config(self):
+        config = super().get_config()
+        config["axis"] = self.axis
+        return config
+
+
+@register_keras_serializable(package="doccorner_v2")
+class HeatmapOffsetDecode(layers.Layer):
+    """Decode per-corner heatmaps + local offsets into normalized coordinates."""
+
+    def __init__(self, tau: float = 1.0, offset_scale: float = 0.5, **kwargs):
+        super().__init__(**kwargs)
+        self.tau = float(tau)
+        self.offset_scale = float(offset_scale)
+        self._h = None
+        self._w = None
+        self._hw = None
+        self._grid_x = None
+        self._grid_y = None
+
+    def build(self, input_shape):
+        heatmap_shape, offset_shape = input_shape
+        h, w, c = heatmap_shape[1], heatmap_shape[2], heatmap_shape[3]
+        oh, ow, oc = offset_shape[1], offset_shape[2], offset_shape[3]
+        if h is None or w is None or c != 4:
+            raise ValueError("HeatmapOffsetDecode requires heatmap shape [B,H,W,4].")
+        if oh != h or ow != w or oc != 8:
+            raise ValueError("HeatmapOffsetDecode requires offset shape [B,H,W,8] aligned to heatmaps.")
+
+        self._h = int(h)
+        self._w = int(w)
+        self._hw = self._h * self._w
+
+        x_centers = (np.arange(self._w, dtype=np.float32) + 0.5) / float(self._w)
+        y_centers = (np.arange(self._h, dtype=np.float32) + 0.5) / float(self._h)
+        grid_x, grid_y = np.meshgrid(x_centers, y_centers)
+        self._grid_x = tf.constant(grid_x.reshape(1, 1, self._hw), dtype=tf.float32)
+        self._grid_y = tf.constant(grid_y.reshape(1, 1, self._hw), dtype=tf.float32)
+        super().build(input_shape)
+
+    def call(self, inputs):
+        if self._grid_x is None:
+            raise RuntimeError("HeatmapOffsetDecode is not built.")
+
+        heatmap_logits, offset_map = inputs
+        heatmap_logits = tf.cast(heatmap_logits, tf.float32)
+        offset_map = tf.cast(offset_map, tf.float32)
+        batch_size = tf.shape(heatmap_logits)[0]
+
+        heatmap_logits = tf.transpose(heatmap_logits, [0, 3, 1, 2])  # [B, 4, H, W]
+        heatmap_logits = tf.reshape(heatmap_logits, [batch_size, 4, self._hw])
+        probs = tf.nn.softmax(heatmap_logits / self.tau, axis=-1)
+
+        offset_map = tf.reshape(offset_map, [batch_size, self._h, self._w, 4, 2])
+        offset_map = tf.transpose(offset_map, [0, 3, 1, 2, 4])  # [B, 4, H, W, 2]
+        offset_map = tf.reshape(offset_map, [batch_size, 4, self._hw, 2])
+        offset_map = tf.clip_by_value(offset_map, -1.0, 1.0) * self.offset_scale
+
+        dx = offset_map[..., 0] / float(self._w)
+        dy = offset_map[..., 1] / float(self._h)
+
+        x = tf.reduce_sum(probs * (self._grid_x + dx), axis=-1)
+        y = tf.reduce_sum(probs * (self._grid_y + dy), axis=-1)
+
+        xy = tf.concat([tf.expand_dims(x, -1), tf.expand_dims(y, -1)], axis=-1)
+        coords = tf.reshape(xy, [batch_size, 8])
+        return tf.clip_by_value(coords, 0.0, 1.0)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"tau": self.tau, "offset_scale": self.offset_scale})
+        return config
+
+
+@register_keras_serializable(package="doccorner_v2")
+class HeatmapOffsetRefine(layers.Layer):
+    """Refine coarse normalized coordinates using heatmap-weighted local offsets."""
+
+    def __init__(self, tau: float = 1.0, offset_scale: float = 0.5, **kwargs):
+        super().__init__(**kwargs)
+        self.tau = float(tau)
+        self.offset_scale = float(offset_scale)
+        self._h = None
+        self._w = None
+        self._hw = None
+
+    def build(self, input_shape):
+        coarse_shape, heatmap_shape, offset_shape = input_shape
+        if coarse_shape[-1] != 8:
+            raise ValueError("HeatmapOffsetRefine requires coarse coords shape [B,8].")
+        h, w, c = heatmap_shape[1], heatmap_shape[2], heatmap_shape[3]
+        oh, ow, oc = offset_shape[1], offset_shape[2], offset_shape[3]
+        if h is None or w is None or c != 4:
+            raise ValueError("HeatmapOffsetRefine requires heatmap shape [B,H,W,4].")
+        if oh != h or ow != w or oc != 8:
+            raise ValueError("HeatmapOffsetRefine requires offset shape [B,H,W,8] aligned to heatmaps.")
+        self._h = int(h)
+        self._w = int(w)
+        self._hw = self._h * self._w
+        super().build(input_shape)
+
+    def call(self, inputs):
+        coarse_coords, heatmap_logits, offset_map = inputs
+        coarse_coords = tf.cast(coarse_coords, tf.float32)
+        heatmap_logits = tf.cast(heatmap_logits, tf.float32)
+        offset_map = tf.cast(offset_map, tf.float32)
+        batch_size = tf.shape(heatmap_logits)[0]
+
+        heatmap_logits = tf.transpose(heatmap_logits, [0, 3, 1, 2])  # [B,4,H,W]
+        heatmap_logits = tf.reshape(heatmap_logits, [batch_size, 4, self._hw])
+        probs = tf.nn.softmax(heatmap_logits / self.tau, axis=-1)
+
+        offset_map = tf.reshape(offset_map, [batch_size, self._h, self._w, 4, 2])
+        offset_map = tf.transpose(offset_map, [0, 3, 1, 2, 4])
+        offset_map = tf.reshape(offset_map, [batch_size, 4, self._hw, 2])
+        offset_map = tf.clip_by_value(offset_map, -1.0, 1.0) * self.offset_scale
+
+        dx = tf.reduce_sum(probs * (offset_map[..., 0] / float(self._w)), axis=-1)
+        dy = tf.reduce_sum(probs * (offset_map[..., 1] / float(self._h)), axis=-1)
+        delta = tf.reshape(tf.stack([dx, dy], axis=-1), [batch_size, 8])
+        return tf.clip_by_value(coarse_coords + delta, 0.0, 1.0)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"tau": self.tau, "offset_scale": self.offset_scale})
+        return config
+
+
 # ---------------------------------------------------------------------------
 # Backbone feature extraction
 # ---------------------------------------------------------------------------
@@ -307,24 +448,18 @@ def build_doccorner_v2(
     p_fused = _separable_conv_block(p_fused, fpn_ch, "simcc_refine2")  # [B, 56, 56, fpn_ch]
 
     # -----------------------------------------------------------------------
-    # Corner-Specific Spatial Attention
+    # Corner-Specific Spatial Attention + Hybrid SimCC/2D Refinement Head
     # -----------------------------------------------------------------------
-    # Shared precursor: lightweight SepConv on fused features
-    shared = _separable_conv_block(p_fused, fpn_ch, "corner_precursor")  # [B, 56, 56, fpn_ch]
+    head_ch = max(int(fpn_ch), int(simcc_ch) // 2)
+    shared = _separable_conv_block(p_fused, head_ch, "corner_precursor")
 
-    # 4 corner attention maps: Conv2D(1,1) → sigmoid
     corner_names = ["tl", "tr", "br", "bl"]
-    attended_feats = []
-    for cn in corner_names:
-        att = layers.Conv2D(1, 1, padding="same", name=f"att_{cn}_conv")(shared)
-        att = layers.Activation("sigmoid", name=f"att_{cn}_sigmoid")(att)  # [B, 56, 56, 1]
-        feat = layers.Multiply(name=f"att_{cn}_mul")([p_fused, att])  # [B, 56, 56, fpn_ch]
-        attended_feats.append(feat)
+    heatmap_logits_list = []
+    offset_logits_list = []
+    x_logits_list = []
+    y_logits_list = []
 
-    # -----------------------------------------------------------------------
-    # Per-corner SimCC path (shared Conv1D weights across corners)
-    # -----------------------------------------------------------------------
-    # Define shared layers (called once per corner = weight sharing)
+    # Shared SimCC layers (same weights reused for each corner).
     simcc_x_conv1 = layers.Conv1D(simcc_ch, simcc_kernel_size, padding="same", name="simcc_x_conv1")
     simcc_x_bn1 = layers.BatchNormalization(name="simcc_x_bn1")
     simcc_x_conv2 = layers.Conv1D(simcc_ch // 2, 3, padding="same", name="simcc_x_conv2")
@@ -347,69 +482,78 @@ def build_doccorner_v2(
         name="simcc_y_out",
     )
 
-    # Global context (shared across corners)
-    global_feat = layers.GlobalAveragePooling2D(name="simcc_global_gap")(p_fused)  # [B, fpn_ch]
+    global_feat = layers.GlobalAveragePooling2D(name="simcc_global_gap")(p_fused)
     global_feat = layers.Dense(simcc_ch // 2, name="simcc_global_fc")(global_feat)
     global_feat = layers.ReLU(name="simcc_global_relu")(global_feat)
     global_x_bc = Broadcast1D(target_length=num_bins, name="global_x_broadcast")(global_feat)
     global_y_bc = Broadcast1D(target_length=num_bins, name="global_y_broadcast")(global_feat)
 
-    # Shared AxisMean layers
-    axis_mean_x = AxisMean(axis=1, name="x_marginal_pool")  # reduce H → [B, W, C]
-    axis_mean_y = AxisMean(axis=2, name="y_marginal_pool")  # reduce W → [B, H, C]
+    axis_mean_x = AxisMean(axis=1, name="x_marginal_pool")
+    axis_mean_y = AxisMean(axis=2, name="y_marginal_pool")
     resize_x = Resize1D(target_length=num_bins, name="x_marginal_resize")
     resize_y = Resize1D(target_length=num_bins, name="y_marginal_resize")
 
-    x_logits_list = []
-    y_logits_list = []
+    for cn in corner_names:
+        att = layers.Conv2D(1, 1, padding="same", name=f"att_{cn}_conv")(shared)
+        att = layers.Activation("sigmoid", name=f"att_{cn}_sigmoid")(att)
+        feat = layers.Multiply(name=f"att_{cn}_mul")([p_fused, att])
 
-    for i, feat in enumerate(attended_feats):
-        cn = corner_names[i]
+        hm_feat = _separable_conv_block(feat, head_ch, f"heatmap_{cn}_refine")
+        hm_logit = layers.Conv2D(
+            1, 1,
+            kernel_initializer=keras.initializers.RandomNormal(stddev=0.01),
+            bias_initializer=keras.initializers.Zeros(),
+            name=f"heatmap_{cn}_logit",
+        )(hm_feat)
+        heatmap_logits_list.append(hm_logit)
 
-        # Per-corner axis marginalization
-        x_marg = axis_mean_x(feat)  # [B, W=56, fpn_ch]
-        y_marg = axis_mean_y(feat)  # [B, H=56, fpn_ch]
+        off_feat = _separable_conv_block(feat, head_ch, f"offset_{cn}_refine")
+        off_raw = layers.Conv2D(
+            2, 1,
+            kernel_initializer=keras.initializers.RandomNormal(stddev=0.01),
+            bias_initializer=keras.initializers.Zeros(),
+            name=f"offset_{cn}_raw",
+        )(off_feat)
+        off = layers.Activation("tanh", name=f"offset_{cn}_tanh")(off_raw)
+        offset_logits_list.append(off)
 
-        # Resize to num_bins
-        x_marg = resize_x(x_marg)  # [B, num_bins, fpn_ch]
-        y_marg = resize_y(y_marg)  # [B, num_bins, fpn_ch]
+        # Keep the coarse SimCC path identical to the stable v2 recipe.
+        # The 2D branch only refines the final coordinates through a small delta.
+        x_marg = axis_mean_x(feat)
+        y_marg = axis_mean_y(feat)
+        x_marg = resize_x(x_marg)
+        y_marg = resize_y(y_marg)
 
-        # Shared SimCC Conv1D pipeline for X
         xf = simcc_x_conv1(x_marg)
         xf = simcc_x_bn1(xf)
         xf = layers.ReLU(name=f"simcc_x_relu1_{cn}")(xf)
         xf = simcc_x_conv2(xf)
         xf = simcc_x_bn2(xf)
         xf = layers.ReLU(name=f"simcc_x_relu2_{cn}")(xf)
+        xf = layers.Concatenate(name=f"simcc_x_cat_{cn}")([xf, global_x_bc])
+        x_logits_list.append(simcc_x_out(xf))
 
-        # Concat global context
-        xf = layers.Concatenate(name=f"simcc_x_cat_{cn}")([xf, global_x_bc])  # [B, num_bins, simcc_ch]
-
-        # Output: 1 logit per bin for this corner
-        x_logit = simcc_x_out(xf)  # [B, num_bins, 1]
-        x_logits_list.append(x_logit)
-
-        # Shared SimCC Conv1D pipeline for Y
         yf = simcc_y_conv1(y_marg)
         yf = simcc_y_bn1(yf)
         yf = layers.ReLU(name=f"simcc_y_relu1_{cn}")(yf)
         yf = simcc_y_conv2(yf)
         yf = simcc_y_bn2(yf)
         yf = layers.ReLU(name=f"simcc_y_relu2_{cn}")(yf)
-
         yf = layers.Concatenate(name=f"simcc_y_cat_{cn}")([yf, global_y_bc])
-        y_logit = simcc_y_out(yf)  # [B, num_bins, 1]
-        y_logits_list.append(y_logit)
+        y_logits_list.append(simcc_y_out(yf))
 
-    # Stack corners: 4 × [B, num_bins, 1] → [B, num_bins, 4] → permute → [B, 4, num_bins]
-    simcc_x = layers.Concatenate(axis=-1, name="simcc_x_stack")(x_logits_list)  # [B, num_bins, 4]
-    simcc_x = layers.Permute((2, 1), name="simcc_x")(simcc_x)  # [B, 4, num_bins]
+    corner_heatmap = layers.Concatenate(axis=-1, name="corner_heatmap")(heatmap_logits_list)
+    corner_offset = layers.Concatenate(axis=-1, name="corner_offset")(offset_logits_list)
 
+    simcc_x = layers.Concatenate(axis=-1, name="simcc_x_stack")(x_logits_list)
+    simcc_x = layers.Permute((2, 1), name="simcc_x")(simcc_x)
     simcc_y = layers.Concatenate(axis=-1, name="simcc_y_stack")(y_logits_list)
     simcc_y = layers.Permute((2, 1), name="simcc_y")(simcc_y)
 
-    # Decode coordinates
-    coords = SimCCDecode(num_bins=num_bins, tau=tau, name="coords")([simcc_x, simcc_y])
+    coarse_coords = SimCCDecode(num_bins=num_bins, tau=tau, name="coords_coarse")([simcc_x, simcc_y])
+    coords = HeatmapOffsetRefine(tau=tau, offset_scale=0.05, name="coords")(
+        [coarse_coords, corner_heatmap, corner_offset]
+    )
 
     # -----------------------------------------------------------------------
     # Score Head: document presence from C5
@@ -429,6 +573,8 @@ def build_doccorner_v2(
         outputs={
             "simcc_x": simcc_x,
             "simcc_y": simcc_y,
+            "corner_heatmap": corner_heatmap,
+            "corner_offset": corner_offset,
             "score_logit": score_logit,
             "coords": coords,
         },
