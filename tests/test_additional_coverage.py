@@ -239,7 +239,10 @@ class TestLossesEdgeCases:
              "coords": np.random.uniform(0.1, 0.9, (2, 8)).astype(np.float32)}
         trainer.train_step((x, y))
         md = trainer._get_metrics_dict()
-        assert set(md.keys()) == {"loss", "loss_simcc", "loss_coord", "loss_score", "iou", "corner_err_px"}
+        assert set(md.keys()) == {
+            "loss", "loss_simcc", "loss_coord", "loss_heatmap", "loss_coord2d",
+            "loss_score", "iou", "corner_err_px",
+        }
 
 
 # -----------------------------------------------------------------------

@@ -3,7 +3,9 @@ Loss functions for DocCornerNet V2.
 
 Contains:
 - gaussian_1d_targets: Generate 1D Gaussian target distributions
+- gaussian_2d_targets: Generate 2D Gaussian target distributions
 - SimCCLoss: Cross-entropy loss with soft Gaussian targets
+- HeatmapCELoss: Spatial cross-entropy loss with 2D Gaussian targets
 - CoordLoss: Direct coordinate supervision (L1/SmoothL1)
 - DocCornerNetV2Trainer: Custom training wrapper with proper loss masking
 """
@@ -33,6 +35,41 @@ def gaussian_1d_targets(coords_01, bins=224, sigma_px=2.0, label_smoothing=0.0):
 
     if label_smoothing > 0.0:
         uniform = tf.ones_like(gauss) / tf.cast(bins, tf.float32)
+        gauss = (1.0 - label_smoothing) * gauss + label_smoothing * uniform
+
+    return gauss
+
+
+def gaussian_2d_targets(coords_xy_01, height=56, width=56, sigma_cells=1.5, label_smoothing=0.0):
+    """
+    Generate normalized 2D Gaussian target distributions for per-corner heatmaps.
+
+    Args:
+        coords_xy_01: [B, 4, 2] normalized coordinates in [0, 1]
+        height: Heatmap height
+        width: Heatmap width
+        sigma_cells: Gaussian sigma in heatmap cell units
+        label_smoothing: Blend factor with uniform distribution
+
+    Returns:
+        targets: [B, 4, H, W] normalized 2D Gaussian distributions
+    """
+    coords_x = coords_xy_01[:, :, 0] * tf.cast(width, tf.float32) - 0.5
+    coords_y = coords_xy_01[:, :, 1] * tf.cast(height, tf.float32) - 0.5
+
+    xs = tf.cast(tf.range(width), tf.float32)
+    ys = tf.cast(tf.range(height), tf.float32)
+    grid_x, grid_y = tf.meshgrid(xs, ys)
+    grid_x = grid_x[None, None, :, :]
+    grid_y = grid_y[None, None, :, :]
+
+    dx = grid_x - coords_x[:, :, None, None]
+    dy = grid_y - coords_y[:, :, None, None]
+    gauss = tf.exp(-0.5 * (tf.square(dx) + tf.square(dy)) / (sigma_cells * sigma_cells))
+    gauss = gauss / (tf.reduce_sum(gauss, axis=[-2, -1], keepdims=True) + 1e-9)
+
+    if label_smoothing > 0.0:
+        uniform = tf.ones_like(gauss) / tf.cast(height * width, tf.float32)
         gauss = (1.0 - label_smoothing) * gauss + label_smoothing * uniform
 
     return gauss
@@ -76,6 +113,40 @@ class SimCCLoss(keras.layers.Layer):
         return loss
 
 
+class HeatmapCELoss(keras.layers.Layer):
+    """Spatial cross-entropy loss with 2D Gaussian targets for corner heatmaps."""
+
+    def __init__(self, height=None, width=None, sigma_cells=1.5, tau=1.0, label_smoothing=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.height = height
+        self.width = width
+        self.sigma_cells = sigma_cells
+        self.tau = tau
+        self.label_smoothing = label_smoothing
+
+    def call(self, heatmap_logits, gt_coords, mask):
+        height = self.height if self.height is not None else tf.shape(heatmap_logits)[1]
+        width = self.width if self.width is not None else tf.shape(heatmap_logits)[2]
+        gt_xy = tf.reshape(gt_coords, [-1, 4, 2])
+        target = gaussian_2d_targets(
+            gt_xy,
+            height=height,
+            width=width,
+            sigma_cells=self.sigma_cells,
+            label_smoothing=self.label_smoothing,
+        )
+        target = tf.reshape(target, [-1, 4, height * width])
+
+        logits = tf.transpose(heatmap_logits, [0, 3, 1, 2])
+        logits = tf.reshape(logits, [-1, 4, height * width])
+        log_pred = tf.nn.log_softmax(logits / self.tau, axis=-1)
+
+        ce = -tf.reduce_sum(target * log_pred, axis=-1)
+        ce = tf.reduce_mean(ce, axis=-1)
+        loss = tf.reduce_sum(ce * mask) / (tf.reduce_sum(mask) + 1e-9)
+        return loss
+
+
 class CoordLoss(keras.layers.Layer):
     """Direct coordinate loss (L1 or SmoothL1)."""
 
@@ -115,6 +186,8 @@ class DocCornerNetV2Trainer(keras.Model):
     Handles:
     - SimCC loss on X/Y marginals (only positive samples)
     - Coordinate loss (only positive samples)
+    - 2D heatmap CE loss on corner heatmaps (only positive samples)
+    - Direct coordinate loss on the decoded 2D branch (only positive samples)
     - Score BCE loss (all samples)
 
     Input format:
@@ -130,7 +203,10 @@ class DocCornerNetV2Trainer(keras.Model):
         tau=1.0,
         w_simcc=1.0,
         w_coord=0.2,
+        w_heatmap=0.0,
+        w_coord2d=0.2,
         w_score=1.0,
+        heatmap_sigma_cells=1.5,
         label_smoothing=0.0,
         **kwargs,
     ):
@@ -141,17 +217,27 @@ class DocCornerNetV2Trainer(keras.Model):
         self.tau = tau
         self.w_simcc = w_simcc
         self.w_coord = w_coord
+        self.w_heatmap = w_heatmap
+        self.w_coord2d = w_coord2d
         self.w_score = w_score
+        self.heatmap_sigma_cells = heatmap_sigma_cells
         self.label_smoothing = label_smoothing
 
         self.simcc_loss_fn = SimCCLoss(
             bins=bins, sigma_px=sigma_px, tau=tau, label_smoothing=label_smoothing,
         )
+        self.heatmap_loss_fn = HeatmapCELoss(
+            height=None, width=None, sigma_cells=heatmap_sigma_cells, tau=tau,
+            label_smoothing=label_smoothing,
+        )
         self.coord_loss_fn = CoordLoss(loss_type="l1")
+        self.coord2d_loss_fn = CoordLoss(loss_type="l1")
 
         self.loss_tracker = keras.metrics.Mean(name="loss")
         self.simcc_loss_tracker = keras.metrics.Mean(name="loss_simcc")
         self.coord_loss_tracker = keras.metrics.Mean(name="loss_coord")
+        self.heatmap_loss_tracker = keras.metrics.Mean(name="loss_heatmap")
+        self.coord2d_loss_tracker = keras.metrics.Mean(name="loss_coord2d")
         self.score_loss_tracker = keras.metrics.Mean(name="loss_score")
         self.iou_tracker = keras.metrics.Mean(name="iou")
         self.corner_err_tracker = keras.metrics.Mean(name="corner_err_px")
@@ -162,6 +248,8 @@ class DocCornerNetV2Trainer(keras.Model):
             self.loss_tracker,
             self.simcc_loss_tracker,
             self.coord_loss_tracker,
+            self.heatmap_loss_tracker,
+            self.coord2d_loss_tracker,
             self.score_loss_tracker,
             self.iou_tracker,
             self.corner_err_tracker,
@@ -180,7 +268,9 @@ class DocCornerNetV2Trainer(keras.Model):
     def _compute_losses(self, outputs, has_doc, coords_gt):
         simcc_x = outputs["simcc_x"]
         simcc_y = outputs["simcc_y"]
+        corner_heatmap = outputs["corner_heatmap"]
         score_logit = outputs["score_logit"]
+        coords_2d = outputs["coords_2d"]
         coords_pred = outputs["coords"]
 
         loss_score = tf.nn.sigmoid_cross_entropy_with_logits(
@@ -190,18 +280,25 @@ class DocCornerNetV2Trainer(keras.Model):
 
         loss_simcc = self.simcc_loss_fn(simcc_x, simcc_y, coords_gt, has_doc)
         loss_coord = self.coord_loss_fn(coords_pred, coords_gt, has_doc)
+        loss_heatmap = self.heatmap_loss_fn(corner_heatmap, coords_gt, has_doc)
+        loss_coord2d = self.coord2d_loss_fn(coords_2d, coords_gt, has_doc)
 
         loss = (
             self.w_simcc * loss_simcc
             + self.w_coord * loss_coord
+            + self.w_heatmap * loss_heatmap
+            + self.w_coord2d * loss_coord2d
             + self.w_score * loss_score
         )
-        return loss, loss_simcc, loss_coord, loss_score, coords_pred
+        return loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred
 
-    def _update_metrics(self, loss, loss_simcc, loss_coord, loss_score, coords_pred, coords_gt, has_doc):
+    def _update_metrics(self, loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d,
+                        loss_score, coords_pred, coords_gt, has_doc):
         self.loss_tracker.update_state(loss)
         self.simcc_loss_tracker.update_state(loss_simcc)
         self.coord_loss_tracker.update_state(loss_coord)
+        self.heatmap_loss_tracker.update_state(loss_heatmap)
+        self.coord2d_loss_tracker.update_state(loss_coord2d)
         self.score_loss_tracker.update_state(loss_score)
 
         iou, corner_err = self._compute_geometry_metrics(coords_pred, coords_gt, has_doc)
@@ -213,6 +310,8 @@ class DocCornerNetV2Trainer(keras.Model):
             "loss": self.loss_tracker.result(),
             "loss_simcc": self.simcc_loss_tracker.result(),
             "loss_coord": self.coord_loss_tracker.result(),
+            "loss_heatmap": self.heatmap_loss_tracker.result(),
+            "loss_coord2d": self.coord2d_loss_tracker.result(),
             "loss_score": self.score_loss_tracker.result(),
             "iou": self.iou_tracker.result(),
             "corner_err_px": self.corner_err_tracker.result(),
@@ -222,35 +321,46 @@ class DocCornerNetV2Trainer(keras.Model):
     def _compiled_train_body(self, x, has_doc, coords_gt):
         with tf.GradientTape() as tape:
             outputs = self.net(x, training=True)
-            loss, loss_simcc, loss_coord, loss_score, coords_pred = self._compute_losses(
+            loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = self._compute_losses(
                 outputs, has_doc, coords_gt,
             )
         grads = tape.gradient(loss, self.net.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.net.trainable_variables))
-        return loss, loss_simcc, loss_coord, loss_score, coords_pred
+        return loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred
 
     @tf.function
     def _compiled_test_body(self, x, has_doc, coords_gt):
         outputs = self.net(x, training=False)
-        loss, loss_simcc, loss_coord, loss_score, coords_pred = self._compute_losses(
+        loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = self._compute_losses(
             outputs, has_doc, coords_gt,
         )
-        return loss, loss_simcc, loss_coord, loss_score, coords_pred, outputs["coords"], outputs["score_logit"]
+        return (
+            loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score,
+            coords_pred, outputs["coords"], outputs["score_logit"]
+        )
 
     def train_step(self, data):
         x, y = data
         has_doc, coords_gt = self._extract_targets(y)
-        loss, loss_simcc, loss_coord, loss_score, coords_pred = self._compiled_train_body(x, has_doc, coords_gt)
-        self._update_metrics(loss, loss_simcc, loss_coord, loss_score, coords_pred, coords_gt, has_doc)
+        loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = (
+            self._compiled_train_body(x, has_doc, coords_gt)
+        )
+        self._update_metrics(
+            loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d,
+            loss_score, coords_pred, coords_gt, has_doc,
+        )
         return self._get_metrics_dict()
 
     def test_step(self, data):
         x, y = data
         has_doc, coords_gt = self._extract_targets(y)
-        loss, loss_simcc, loss_coord, loss_score, coords_pred, out_coords, out_score_logit = (
+        loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred, out_coords, out_score_logit = (
             self._compiled_test_body(x, has_doc, coords_gt)
         )
-        self._update_metrics(loss, loss_simcc, loss_coord, loss_score, coords_pred, coords_gt, has_doc)
+        self._update_metrics(
+            loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d,
+            loss_score, coords_pred, coords_gt, has_doc,
+        )
         return self._get_metrics_dict(), out_coords, out_score_logit
 
     def _compute_geometry_metrics(self, pred_coords, gt_coords, mask):

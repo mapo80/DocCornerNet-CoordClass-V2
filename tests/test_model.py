@@ -273,6 +273,7 @@ class TestModelConstruction:
         assert "simcc_y" in out
         assert "corner_heatmap" in out
         assert "corner_offset" in out
+        assert "coords_2d" in out
         assert "score_logit" in out
         assert "coords" in out
 
@@ -283,6 +284,7 @@ class TestModelConstruction:
         assert out["simcc_y"].shape == (2, 4, 224)
         assert out["corner_heatmap"].shape == (2, 56, 56, 4)
         assert out["corner_offset"].shape == (2, 56, 56, 8)
+        assert out["coords_2d"].shape == (2, 8)
         assert out["score_logit"].shape == (2, 1)
         assert out["coords"].shape == (2, 8)
 

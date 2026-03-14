@@ -8,7 +8,9 @@ from tensorflow import keras
 from model import create_model
 from losses import (
     gaussian_1d_targets,
+    gaussian_2d_targets,
     SimCCLoss,
+    HeatmapCELoss,
     CoordLoss,
     DocCornerNetV2Trainer,
 )
@@ -57,6 +59,38 @@ class TestGaussian1DTargets:
         t_wide = gaussian_1d_targets(coords, bins=224, sigma_px=4.0)
         # Narrow sigma → more peaked
         assert t_narrow.numpy().max() > t_wide.numpy().max()
+
+
+class TestGaussian2DTargets:
+    def test_shape(self):
+        coords = tf.constant([[[0.2, 0.3], [0.5, 0.5], [0.8, 0.7], [0.3, 0.8]]], dtype=tf.float32)
+        targets = gaussian_2d_targets(coords, height=56, width=56, sigma_cells=1.5)
+        assert targets.shape == (1, 4, 56, 56)
+
+    def test_normalized(self):
+        coords = tf.constant([[[0.5, 0.5]] * 4], dtype=tf.float32)
+        targets = gaussian_2d_targets(coords, height=56, width=56, sigma_cells=1.5)
+        sums = tf.reduce_sum(targets, axis=[-2, -1]).numpy()
+        np.testing.assert_allclose(sums, 1.0, atol=1e-5)
+
+
+class TestHeatmapCELoss:
+    def test_basic(self):
+        loss_fn = HeatmapCELoss(height=56, width=56, sigma_cells=1.5, tau=1.0)
+        hm = tf.random.normal([2, 56, 56, 4])
+        gt = tf.random.uniform([2, 8], 0.1, 0.9)
+        mask = tf.ones([2])
+        loss = loss_fn(hm, gt, mask)
+        assert loss.shape == ()
+        assert loss.numpy() > 0
+
+    def test_zero_mask(self):
+        loss_fn = HeatmapCELoss(height=56, width=56, sigma_cells=1.5, tau=1.0)
+        hm = tf.random.normal([2, 56, 56, 4])
+        gt = tf.random.uniform([2, 8], 0.1, 0.9)
+        mask = tf.zeros([2])
+        loss = loss_fn(hm, gt, mask)
+        assert loss.numpy() == pytest.approx(0.0, abs=1e-6)
 
 
 class TestSimCCLoss:
@@ -171,6 +205,8 @@ class TestDocCornerNetV2Trainer:
         assert "loss" in metrics
         assert "loss_simcc" in metrics
         assert "loss_coord" in metrics
+        assert "loss_heatmap" in metrics
+        assert "loss_coord2d" in metrics
         assert "loss_score" in metrics
         assert "iou" in metrics
         assert "corner_err_px" in metrics
@@ -188,7 +224,7 @@ class TestDocCornerNetV2Trainer:
         assert "coords" in out
 
     def test_metrics_property(self, trainer):
-        assert len(trainer.metrics) == 6
+        assert len(trainer.metrics) == 8
 
     def test_all_negative_samples(self, trainer):
         B = 4

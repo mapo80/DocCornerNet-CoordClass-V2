@@ -354,7 +354,10 @@ def parse_args():
     parser.add_argument("--loss_tau", type=float, default=0.5)
     parser.add_argument("--w_simcc", type=float, default=1.0)
     parser.add_argument("--w_coord", type=float, default=0.2)
+    parser.add_argument("--w_heatmap", type=float, default=0.0)
+    parser.add_argument("--w_coord2d", type=float, default=0.2)
     parser.add_argument("--w_score", type=float, default=1.0)
+    parser.add_argument("--heatmap_sigma_cells", type=float, default=1.5)
     parser.add_argument("--label_smoothing", type=float, default=0.0)
 
     # Init
@@ -495,7 +498,10 @@ def main():
         tau=args.loss_tau,
         w_simcc=args.w_simcc,
         w_coord=args.w_coord,
+        w_heatmap=args.w_heatmap,
+        w_coord2d=args.w_coord2d,
         w_score=args.w_score,
+        heatmap_sigma_cells=args.heatmap_sigma_cells,
         label_smoothing=args.label_smoothing,
     )
 
@@ -522,7 +528,9 @@ def main():
     print(f"  Input:    {args.img_size}x{args.img_size} bins={args.num_bins} norm={args.input_norm}")
     print(f"  Training: epochs={args.epochs} batch={args.batch_size} lr={args.learning_rate}")
     print(f"  Loss:     sigma_px={args.sigma_px} loss_tau={args.loss_tau} "
-          f"w_simcc={args.w_simcc} w_coord={args.w_coord} w_score={args.w_score}")
+          f"w_simcc={args.w_simcc} w_coord={args.w_coord} "
+          f"w_heatmap={args.w_heatmap} w_coord2d={args.w_coord2d} "
+          f"w_score={args.w_score} hm_sigma={args.heatmap_sigma_cells}")
     print(f"  Schedule: warmup={args.warmup_epochs}ep cosine wd={args.weight_decay}")
     if effective_aug_factor > 1:
         print(f"  Aug factor: {effective_aug_factor}x "

@@ -14,6 +14,7 @@ Output dict keys:
   simcc_y:        [B, 4, num_bins]   Y marginal logits per corner
   corner_heatmap: [B, 56, 56, 4]     Corner heatmap logits
   corner_offset:  [B, 56, 56, 8]     Corner local offsets (dx,dy per corner)
+  coords_2d:      [B, 8]             Direct 2D decode from heatmap+offset branch
   score_logit:    [B, 1]             Document presence logit
   coords:         [B, 8]             Decoded normalized coordinates
 """
@@ -551,9 +552,13 @@ def build_doccorner_v2(
     simcc_y = layers.Permute((2, 1), name="simcc_y")(simcc_y)
 
     coarse_coords = SimCCDecode(num_bins=num_bins, tau=tau, name="coords_coarse")([simcc_x, simcc_y])
-    coords = HeatmapOffsetRefine(tau=tau, offset_scale=0.05, name="coords")(
+    coords_refined = HeatmapOffsetRefine(tau=tau, offset_scale=0.05, name="coords_refined")(
         [coarse_coords, corner_heatmap, corner_offset]
     )
+    coords_2d = HeatmapOffsetDecode(tau=tau, offset_scale=0.5, name="coords_2d")(
+        [corner_heatmap, corner_offset]
+    )
+    coords = layers.Identity(name="coords")(coords_refined)
 
     # -----------------------------------------------------------------------
     # Score Head: document presence from C5
@@ -575,6 +580,7 @@ def build_doccorner_v2(
             "simcc_y": simcc_y,
             "corner_heatmap": corner_heatmap,
             "corner_offset": corner_offset,
+            "coords_2d": coords_2d,
             "score_logit": score_logit,
             "coords": coords,
         },
