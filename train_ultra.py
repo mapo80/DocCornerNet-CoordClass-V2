@@ -785,7 +785,7 @@ def parse_args():
                         help="Virtual train multiplier via repeated stochastic views per epoch (1=default)")
     parser.add_argument("--hard_selector_file", type=str, default=None,
                         help="Path to a txt file describing hard source/sample selectors "
-                             "(see HARD_SELECTOR_FORMAT.md)")
+                             "(see docs/HARD_SELECTOR_FORMAT.md)")
     parser.add_argument("--hard_selector_mix_weight", "--hard_source_mix_weight",
                         dest="hard_selector_mix_weight", type=float, default=0.0,
                         help="Fraction of train batches sampled from the hard-selector subset (0 disables)")
@@ -795,7 +795,7 @@ def parse_args():
                         help="Apply geometric augmentation only to selector-matched samples")
     parser.add_argument("--selector_weight_file", type=str, default=None,
                         help="Path to a txt file defining source/sample loss weights "
-                             "(see SELECTOR_WEIGHT_FORMAT.md)")
+                             "(see docs/SELECTOR_WEIGHT_FORMAT.md)")
     parser.add_argument("--source_balance_power", type=float, default=0.0,
                         help="Inverse-frequency exponent for positive source balancing (0 disables)")
     parser.add_argument("--source_balance_cap", type=float, default=4.0,

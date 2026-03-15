@@ -297,7 +297,7 @@ python -m train_ultra \
     --simcc_ch 128 \
     --w_heatmap 0.0 \
     --w_coord2d 0.25 \
-    --selector_weight_file selector_weights.example.txt \
+    --selector_weight_file docs/selector_weights.example.txt \
     --source_balance_power 0.35 \
     --source_balance_cap 3.0 \
     --source_weight_sampling
@@ -398,12 +398,12 @@ When `--augment` is active, the following augmentations are applied batch-wise o
 Two external text-file mechanisms are available and both are generic:
 
 1. **Binary selectors** for diagnostics / hard-subset continuation
-   - docs: [`HARD_SELECTOR_FORMAT.md`](./HARD_SELECTOR_FORMAT.md)
-   - example: [`hard_selectors.example.txt`](./hard_selectors.example.txt)
+   - docs: [`HARD_SELECTOR_FORMAT.md`](./docs/HARD_SELECTOR_FORMAT.md)
+   - example: [`hard_selectors.example.txt`](./docs/hard_selectors.example.txt)
 
 2. **Weighted selectors** for full retraining / source balancing
-   - docs: [`SELECTOR_WEIGHT_FORMAT.md`](./SELECTOR_WEIGHT_FORMAT.md)
-   - example: [`selector_weights.example.txt`](./selector_weights.example.txt)
+   - docs: [`SELECTOR_WEIGHT_FORMAT.md`](./docs/SELECTOR_WEIGHT_FORMAT.md)
+   - example: [`selector_weights.example.txt`](./docs/selector_weights.example.txt)
 
 Relevant CLI flags:
 
@@ -601,11 +601,14 @@ v2/
   evaluate.py       # Evaluation script
   export.py         # TFLite/SavedModel export + benchmarking
   tests/            # 253 tests
-  V2_PROPOSAL.md    # Original design proposal
-  IMPLEMENTATION_NOTES.md
-  IMPLEMENTATION_TRACEABILITY.md
-  HARD_SELECTOR_FORMAT.md
-  SELECTOR_WEIGHT_FORMAT.md
+  docs/
+    V2_PROPOSAL.md
+    IMPLEMENTATION_NOTES.md
+    IMPLEMENTATION_TRACEABILITY.md
+    HARD_SELECTOR_FORMAT.md
+    SELECTOR_WEIGHT_FORMAT.md
+    hard_selectors.example.txt
+    selector_weights.example.txt
 ```
 
 ## Model Outputs
