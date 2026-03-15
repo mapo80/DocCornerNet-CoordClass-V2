@@ -42,15 +42,15 @@ Parallel: C5 -> GAP -> Dense(1) -> score_logit [B, 1]
 
 ## Current Best Model
 
-Frozen reference model:
+Current best generalization-oriented frozen model:
 
-- path: [`models/v2_best_full_current`](./models/v2_best_full_current)
-- weights: [`best_model.weights.h5`](./models/v2_best_full_current/best_model.weights.h5)
-- metadata: [`MODEL_INFO.md`](./models/v2_best_full_current/MODEL_INFO.md)
+- path: [`models/v2_best_full_sourcebalance_current`](./models/v2_best_full_sourcebalance_current)
+- weights: [`best_model.weights.h5`](./models/v2_best_full_sourcebalance_current/best_model.weights.h5)
+- metadata: [`MODEL_INFO.md`](./models/v2_best_full_sourcebalance_current/MODEL_INFO.md)
 
 Training provenance:
 
-- source run: `runs/v3_full_losssup_continue_20ep`
+- source run: `runs/v4_full_sourcebalance_lossonly_conservative`
 - dataset: `dataset/DocCornerDataset`
 - backbone init: `imagenet`
 - core training config:
@@ -64,27 +64,54 @@ Training provenance:
   - `w_heatmap=0.0`
   - `w_coord2d=0.25`
   - `w_score=1.0`
+  - `selector_weight_file=docs/selector_weights.conservative.txt`
+  - `source_balance_power=0.20`
+  - `source_balance_cap=2.0`
+  - `source_weight_sampling=false`
 
 Best validation checkpoint:
 
-- epoch: `17`
-- mean IoU: `0.9837`
-- median IoU: `0.9885`
-- corner error mean: `1.04 px`
+- epoch: `19`
+- mean IoU: `0.9839`
+- median IoU: `0.9884`
+- corner error mean: `1.02 px`
 - corner error p95: `2.63 px`
 - recall@95: `96.6%`
+- classification accuracy: `100.0%`
+- classification F1: `100.0%`
 
 Known test evaluation of the same frozen checkpoint:
 
-- mean IoU: `0.8643`
+- mean IoU: `0.8679`
 - median IoU: `0.9569`
-- corner error mean: `8.53 px`
-- corner error p95: `46.98 px`
-- recall@95: `52.8%`
-- classification accuracy: `97.5%`
-- classification F1: `98.6%`
+- corner error mean: `8.29 px`
+- corner error p95: `44.80 px`
+- recall@90: `66.4%`
+- recall@95: `52.5%`
+- recall@99: `12.5%`
+- classification accuracy: `97.1%`
+- classification F1: `98.3%`
 
-This is the current baseline to beat. Validation is very strong; test remains substantially harder.
+Previous non-balanced baseline remains available in:
+
+- [`models/v2_best_full_current`](./models/v2_best_full_current)
+
+This source-balanced checkpoint is the current model to beat on `test`. Validation remains very strong; test is still substantially harder than validation.
+
+### Frozen Model Comparison
+
+| Model | Path | Training recipe | Best val IoU | Val err mean | Test mean IoU | Test err mean | Test recall@95 | Test acc | Notes |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| Baseline full | [`v2_best_full_current`](./models/v2_best_full_current) | standard full training, no source balancing | `0.9837` | `1.04 px` | `0.8643` | `8.93 px` | `51.6%` | `96.9%` | Best historical non-balanced checkpoint |
+| Source-balanced full | [`v2_best_full_sourcebalance_current`](./models/v2_best_full_sourcebalance_current) | conservative source weights in loss only, no source-weight sampling | `0.9839` | `1.02 px` | `0.8679` | `8.29 px` | `52.5%` | `97.1%` | Current best on `test`; small but consistent gain |
+
+Delta of the source-balanced model vs the previous baseline:
+
+- `val_mean_iou`: `+0.0002`
+- `test_mean_iou`: `+0.0036`
+- `test_corner_error_px`: `-0.64 px`
+- `test_recall@95`: `+0.9 pt`
+- `test_accuracy`: `+0.2 pt`
 
 ## Requirements
 

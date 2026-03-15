@@ -1,0 +1,21 @@
+# Conservative selector weights for full retraining.
+# Goal: help hard sources without breaking the global class prior.
+
+# Protect negatives explicitly.
+negative=2.0
+
+# Card-like hard families.
+idcard_jj=1.35
+idcard_g2wbl=1.35
+idcard_final_polygon=1.50
+segrec=1.25
+midv2019=1.20
+
+# Receipt / paper-heavy families.
+source:receipt_occam=1.40
+source:receipt_segmentation_z4vqo=1.35
+source:receipts_segmentation=1.35
+source:receipts_coolstuff=1.35
+source:seg_paper=1.20
+source:documents_segmentation=1.20
+source:book_page_segmentation_tecgp=1.25

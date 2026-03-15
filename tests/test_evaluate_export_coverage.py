@@ -120,6 +120,7 @@ from export import (
     export_savedmodel,
     export_tflite,
     benchmark_tflite,
+    inspect_tflite_model,
 )
 
 
@@ -200,6 +201,43 @@ class TestExportLoadModel:
         with pytest.raises(ValueError, match="No weights"):
             load_model_for_export(args)
 
+    def test_load_heads_export_mode(self, tmp_path):
+        model = create_model(backbone_weights=None)
+        wp = tmp_path / "best_model.weights.h5"
+        model.save_weights(str(wp))
+
+        args = types.SimpleNamespace(
+            weights=str(tmp_path),
+            alpha=0.35, fpn_ch=32, simcc_ch=96,
+            img_size=224, num_bins=224, tau=1.0,
+            output_mode="heads",
+        )
+        export_model, _ = load_model_for_export(args)
+        x = np.random.randn(1, 224, 224, 3).astype(np.float32)
+        outputs = export_model(x, training=False)
+        assert isinstance(outputs, (list, tuple))
+        assert len(outputs) == 5
+
+    def test_load_simcc_packed_export_mode(self, tmp_path):
+        model = create_model(backbone_weights=None)
+        wp = tmp_path / "best_model.weights.h5"
+        model.save_weights(str(wp))
+
+        args = types.SimpleNamespace(
+            weights=str(tmp_path),
+            alpha=0.35, fpn_ch=32, simcc_ch=96,
+            img_size=224, num_bins=224, tau=1.0,
+            output_mode="simcc_packed",
+        )
+        export_model, _ = load_model_for_export(args)
+        x = np.random.randn(1, 224, 224, 3).astype(np.float32)
+        outputs = export_model(x, training=False)
+        assert isinstance(outputs, (list, tuple))
+        assert len(outputs) == 2
+        shapes = [tuple(t.shape) for t in outputs]
+        assert (1, 1) in shapes
+        assert (1, 224, 8) in shapes
+
 
 class TestExportSavedModel:
     def test_export(self, tmp_path):
@@ -221,6 +259,111 @@ class TestExportTFLiteAdditional:
                              representative_data_path=None)
         assert size > 0
         assert path.exists()
+
+    def test_export_full_int8_with_representative_images(self, tmp_path):
+        model = create_model(backbone_weights=None)
+        inf = create_inference_model(model)
+        rep_dir = tmp_path / "rep_images"
+        rep_dir.mkdir()
+
+        for idx in range(2):
+            img = Image.new("RGB", (48, 48), color=(64 + idx, 128, 192))
+            img.save(rep_dir / f"sample_{idx}.jpg")
+
+        path = tmp_path / "model_int8_full.tflite"
+        size = export_tflite(
+            inf,
+            path,
+            img_size=224,
+            quantize=True,
+            representative_data_path=str(rep_dir),
+            representative_limit=2,
+        )
+        assert size > 0
+        interpreter = tf.lite.Interpreter(model_path=str(path))
+        interpreter.allocate_tensors()
+        assert interpreter.get_input_details()[0]["dtype"] == np.int8
+        assert all(detail["dtype"] == np.int8 for detail in interpreter.get_output_details())
+
+    def test_delegate_report_contains_summary(self, tmp_path):
+        model = create_model(backbone_weights=None)
+        inf = create_inference_model(model)
+        path = tmp_path / "model_float32.tflite"
+        export_tflite(inf, path, img_size=224, quantize=False)
+        report = inspect_tflite_model(path)
+        assert "fully_delegated" in report
+        assert report["execution_plan_nodes"] >= 1
+
+    def test_heads_export_generates_delegate_report(self, tmp_path):
+        train_model = create_model(backbone_weights=None)
+        wp = tmp_path / "best_model.weights.h5"
+        train_model.save_weights(str(wp))
+
+        rep_dir = tmp_path / "rep_images"
+        rep_dir.mkdir()
+        for idx in range(2):
+            img = Image.new("RGB", (48, 48), color=(96 + idx, 64, 160))
+            img.save(rep_dir / f"sample_{idx}.jpg")
+
+        args = types.SimpleNamespace(
+            weights=str(tmp_path),
+            alpha=0.35, fpn_ch=32, simcc_ch=96,
+            img_size=224, num_bins=224, tau=1.0,
+            output_mode="heads",
+        )
+        export_model, _ = load_model_for_export(args)
+
+        path = tmp_path / "model_int8_heads.tflite"
+        export_tflite(
+            export_model,
+            path,
+            img_size=224,
+            quantize=True,
+            representative_data_path=str(rep_dir),
+            representative_limit=2,
+        )
+        report = inspect_tflite_model(path)
+        assert report["delegate_plan_nodes"] >= 1
+        assert report["input_details"][0]["dtype"] == "int8"
+        assert all(detail["dtype"] == "int8" for detail in report["output_details"])
+
+    def test_simcc_packed_export_matches_wasm_layout(self, tmp_path):
+        train_model = create_model(backbone_weights=None)
+        wp = tmp_path / "best_model.weights.h5"
+        train_model.save_weights(str(wp))
+
+        rep_dir = tmp_path / "rep_images"
+        rep_dir.mkdir()
+        for idx in range(2):
+            img = Image.new("RGB", (48, 48), color=(48 + idx, 96, 192))
+            img.save(rep_dir / f"sample_{idx}.jpg")
+
+        args = types.SimpleNamespace(
+            weights=str(tmp_path),
+            alpha=0.35, fpn_ch=32, simcc_ch=96,
+            img_size=224, num_bins=224, tau=1.0,
+            output_mode="simcc_packed",
+        )
+        export_model, _ = load_model_for_export(args)
+
+        path = tmp_path / "model_int8_simcc.tflite"
+        export_tflite(
+            export_model,
+            path,
+            img_size=224,
+            quantize=True,
+            representative_data_path=str(rep_dir),
+            representative_limit=2,
+        )
+        interpreter = tf.lite.Interpreter(model_path=str(path))
+        interpreter.allocate_tensors()
+        output_details = interpreter.get_output_details()
+        assert tuple(output_details[0]["shape"].tolist()) == (1, 1)
+        assert tuple(output_details[1]["shape"].tolist()) == (1, 224, 8)
+
+        report = inspect_tflite_model(path)
+        assert report["input_details"][0]["dtype"] == "int8"
+        assert all(detail["dtype"] == "int8" for detail in report["output_details"])
 
 
 # -----------------------------------------------------------------------

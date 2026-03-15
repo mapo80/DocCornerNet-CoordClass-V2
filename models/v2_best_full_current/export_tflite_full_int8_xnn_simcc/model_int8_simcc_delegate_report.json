@@ -1,0 +1,58 @@
+{
+  "nodes": 227,
+  "before_delegate_nodes": 226,
+  "execution_plan_nodes": 1,
+  "delegate_plan_nodes": 1,
+  "non_delegated_builtin_ops": [],
+  "fully_delegated": true,
+  "input_details": [
+    {
+      "name": "serving_default_image:0",
+      "index": 0,
+      "dtype": "int8",
+      "shape": [
+        1,
+        224,
+        224,
+        3
+      ],
+      "quantization": [
+        0.01865844801068306,
+        -14
+      ]
+    }
+  ],
+  "output_details": [
+    {
+      "name": "StatefulPartitionedCall_1:1",
+      "index": 433,
+      "dtype": "int8",
+      "shape": [
+        1,
+        224,
+        8
+      ],
+      "quantization": [
+        0.07454432547092438,
+        62
+      ]
+    },
+    {
+      "name": "StatefulPartitionedCall_1:0",
+      "index": 272,
+      "dtype": "int8",
+      "shape": [
+        1,
+        1
+      ],
+      "quantization": [
+        0.2705748975276947,
+        -44
+      ]
+    }
+  ],
+  "tensor_dtype_histogram": {
+    "int32": 122,
+    "int8": 312
+  }
+}

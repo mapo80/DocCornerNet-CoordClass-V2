@@ -1,0 +1,24 @@
+============================================================
+DocCornerNet V2 Evaluation
+============================================================
+Loaded config from runs/v4_full_sourcebalance_lossonly_conservative/config.json
+Loaded weights from runs/v4_full_sourcebalance_lossonly_conservative/best_model.weights.h5
+Model parameters: 600,963
+
+Loading test dataset...
+2026-03-15 14:11:38.386937: I tensorflow/core/framework/local_rendezvous.cc:405] Local rendezvous is aborting with status: OUT_OF_RANGE: End of sequence
+
+Geometry Metrics (on 5866 images with documents):
+  Mean IoU:             0.8679
+  Median IoU:           0.9569
+  Corner Error (mean):  8.29 px
+  Corner Error (p95):   44.80 px
+  Recall@90:            66.4%
+  Recall@95:            52.5%
+  Recall@99:            12.5%
+
+Classification Metrics (on 6652 total images):
+  Accuracy:             97.1%
+  F1 Score:             98.3%
+
+Targets: IoU >= 99%: 86.79% [FAIL] | Error <= 1px: 8.29px [FAIL]
