@@ -13,6 +13,7 @@ import gc
 import json
 import math
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,9 @@ from dataset import (
     tf_augment_color_only,
 )
 from metrics import ValidationMetrics
+
+_SOURCE_SUFFIX_RE = re.compile(r"_(\d+)\.[^.]+$")
+_HARD_SELECTOR_PREFIXES = {"source", "sample"}
 
 
 # --------------------------------------------------------------------------
@@ -115,7 +119,7 @@ def _load_single_image(args):
 def _decode_parquet_row(args):
     """Thread-safe: decode a single parquet row (JPEG bytes → resized numpy)."""
     import io
-    img_bytes, is_neg, coord_values, img_size = args
+    img_bytes, is_neg, coord_values, img_size, filename = args
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img = img.resize((img_size, img_size), Image.BILINEAR)
@@ -126,12 +130,12 @@ def _decode_parquet_row(args):
         else:
             coords = np.array(coord_values, dtype=np.float32)
             has_doc = 1.0 if coords.sum() > 0 else 0.0
-        return (img_array, coords, has_doc)
+        return (img_array, coords, has_doc, filename)
     except Exception:
         return None
 
 
-def load_dataset_parquet(data_root, split, img_size, num_workers=16):
+def load_dataset_parquet(data_root, split, img_size, num_workers=16, return_names=False):
     """Load dataset from parquet files (HuggingFace format) with threaded decoding."""
     import pyarrow.parquet as pq
 
@@ -146,6 +150,7 @@ def load_dataset_parquet(data_root, split, img_size, num_workers=16):
 
     # Pre-extract all data from pyarrow (fast, single-thread)
     img_col = table.column("image")
+    filename_col = table.column("filename")
     is_neg_col = table.column("is_negative")
     coord_cols = ["corner_tl_x", "corner_tl_y", "corner_tr_x", "corner_tr_y",
                   "corner_br_x", "corner_br_y", "corner_bl_x", "corner_bl_y"]
@@ -153,9 +158,10 @@ def load_dataset_parquet(data_root, split, img_size, num_workers=16):
     args_list = []
     for i in range(n_images):
         img_bytes = img_col[i].as_py()["bytes"]
+        filename = filename_col[i].as_py()
         is_neg = is_neg_col[i].as_py()
         coord_values = [table.column(cn)[i].as_py() for cn in coord_cols]
-        args_list.append((img_bytes, is_neg, coord_values, img_size))
+        args_list.append((img_bytes, is_neg, coord_values, img_size, filename))
 
     # Parallel JPEG decode + resize
     results = []
@@ -170,26 +176,33 @@ def load_dataset_parquet(data_root, split, img_size, num_workers=16):
     images = np.empty((n_valid, img_size, img_size, 3), dtype=np.uint8)
     coords = np.empty((n_valid, 8), dtype=np.float32)
     has_doc = np.empty(n_valid, dtype=np.float32)
+    names = [] if return_names else None
 
-    for i, (img, c, h) in enumerate(results):
+    for i, (img, c, h, name) in enumerate(results):
         images[i] = img
         coords[i] = c
         has_doc[i] = h
+        if return_names:
+            names.append(name)
 
     del results
     gc.collect()
     print(f"  {n_valid}/{n_images} valid ({int((has_doc == 1).sum())} pos, {int((has_doc == 0).sum())} neg)", flush=True)
+    if return_names:
+        return images, coords, has_doc, np.asarray(names, dtype=object)
     return images, coords, has_doc
 
 
-def load_dataset_fast(data_root, split, img_size, num_workers=32):
+def load_dataset_fast(data_root, split, img_size, num_workers=32, return_names=False):
     """Load dataset using threading (file-based) or parquet."""
     data_root = Path(data_root)
 
     # Check for parquet format first
     split_dir = data_root / split
     if split_dir.is_dir() and any(split_dir.glob("*.parquet")):
-        return load_dataset_parquet(data_root, split, img_size, num_workers=num_workers)
+        return load_dataset_parquet(
+            data_root, split, img_size, num_workers=num_workers, return_names=return_names,
+        )
 
     # Fall back to file-based format
     split_file = data_root / f"{split}.txt"
@@ -208,27 +221,155 @@ def load_dataset_fast(data_root, split, img_size, num_workers=32):
 
     args_list = [(name, str(data_root), img_size) for name in image_names]
     results = []
+    valid_names = [] if return_names else None
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        for result in tqdm(executor.map(_load_single_image, args_list),
+        for name, result in zip(
+            image_names,
+            tqdm(executor.map(_load_single_image, args_list),
                            total=n_images, desc=f"  Loading {split}",
-                           ncols=80, leave=True):
+                           ncols=80, leave=True),
+        ):
             if result is not None:
                 results.append(result)
+                if return_names:
+                    valid_names.append(name)
 
     n_valid = len(results)
     images = np.empty((n_valid, img_size, img_size, 3), dtype=np.uint8)
     coords = np.empty((n_valid, 8), dtype=np.float32)
     has_doc = np.empty(n_valid, dtype=np.float32)
+    names = [] if return_names else None
 
-    for i, (img, c, h) in enumerate(results):
+    for i, result in enumerate(results):
+        img, c, h = result
         images[i] = img
         coords[i] = c
         has_doc[i] = h
+        if return_names:
+            names.append(valid_names[i])
 
     del results
     gc.collect()
     print(f"  {n_valid}/{n_images} valid ({int((has_doc == 1).sum())} pos, {int((has_doc == 0).sum())} neg)", flush=True)
+    if return_names:
+        return images, coords, has_doc, np.asarray(names, dtype=object)
     return images, coords, has_doc
+
+
+def extract_source_name(filename):
+    """Collapse numbered filenames into a source/family identifier."""
+    base = Path(filename).name
+    return _SOURCE_SUFFIX_RE.sub("", base)
+
+
+def load_hard_selector_file(path):
+    """Load hard-sample selectors from a plain-text file.
+
+    Supported line formats:
+    - bare token: treated as `source:<token>`
+    - `source:<source_name>`
+    - `sample:<filename>`
+    Blank lines and lines starting with `#` are ignored.
+    """
+    selector_path = Path(path)
+    if not selector_path.exists():
+        raise ValueError(f"Hard selector file not found: {selector_path}")
+
+    selectors = {"sources": set(), "samples": set()}
+    with selector_path.open("r", encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            kind = "source"
+            value = line
+            if ":" in line:
+                prefix, suffix = line.split(":", 1)
+                kind = prefix.strip().lower()
+                value = suffix.strip()
+                if kind not in _HARD_SELECTOR_PREFIXES:
+                    raise ValueError(
+                        f"Unsupported selector prefix '{prefix}' in {selector_path}:{line_no}. "
+                        "Use 'source:' or 'sample:'."
+                    )
+
+            if not value:
+                raise ValueError(f"Empty hard selector in {selector_path}:{line_no}")
+
+            if kind == "source":
+                selectors["sources"].add(value)
+            else:
+                selectors["samples"].add(Path(value).name)
+
+    return selectors
+
+
+def build_hard_selector_mask(sample_names, has_doc, selectors):
+    """Mark positive samples matched by the configured hard selectors."""
+    if sample_names is None:
+        raise ValueError("sample_names are required for hard selector masking")
+    if not selectors:
+        return np.zeros(len(sample_names), dtype=bool)
+
+    source_names = selectors.get("sources", set())
+    sample_names_exact = selectors.get("samples", set())
+    if not source_names and not sample_names_exact:
+        return np.zeros(len(sample_names), dtype=bool)
+
+    match = np.zeros(len(sample_names), dtype=bool)
+    normalized_names = np.asarray([Path(name).name for name in sample_names], dtype=object)
+
+    if source_names:
+        sources = np.asarray([extract_source_name(name) for name in sample_names], dtype=object)
+        match |= np.isin(sources, list(source_names))
+
+    if sample_names_exact:
+        match |= np.isin(normalized_names, list(sample_names_exact))
+
+    return (has_doc.astype(np.float32) > 0.5) & match
+
+
+def format_hard_selector_summary(selectors):
+    """Return a short printable summary for the selector config."""
+    if not selectors:
+        return "sources=0 samples=0"
+    return f"sources={len(selectors.get('sources', ()))}, samples={len(selectors.get('samples', ()))}"
+
+
+def preview_hard_selector_values(selectors, limit=8):
+    """Return a short human-readable preview of selector values."""
+    preview = []
+    preview.extend(f"source:{value}" for value in sorted(selectors.get("sources", ()))[:limit])
+    remaining = max(0, limit - len(preview))
+    if remaining > 0:
+        preview.extend(f"sample:{value}" for value in sorted(selectors.get("samples", ()))[:remaining])
+    total = len(selectors.get("sources", ())) + len(selectors.get("samples", ()))
+    suffix = " ..." if total > len(preview) else ""
+    return ", ".join(preview) + suffix if preview else "(none)"
+
+
+def resolve_hard_selector_config(args):
+    """Validate hard-selector arguments and load the selector file if present."""
+    if args.hard_selector_mix_weight < 0.0 or args.hard_selector_mix_weight >= 1.0:
+        raise ValueError("--hard_selector_mix_weight must be in [0.0, 1.0)")
+
+    if not args.hard_selector_file:
+        if args.hard_selector_mix_weight > 0.0:
+            raise ValueError("--hard_selector_mix_weight > 0 requires --hard_selector_file")
+        if args.report_val_hard:
+            raise ValueError("--report_val_hard requires --hard_selector_file")
+        if getattr(args, "augment_selector_only", False):
+            raise ValueError("--augment_selector_only requires --hard_selector_file")
+        return None
+
+    if getattr(args, "augment_selector_only", False) and not args.augment:
+        raise ValueError("--augment_selector_only requires --augment")
+
+    selectors = load_hard_selector_file(args.hard_selector_file)
+    if not selectors["sources"] and not selectors["samples"]:
+        raise ValueError(f"--hard_selector_file {args.hard_selector_file} did not define any selectors")
+    return selectors
 
 
 # --------------------------------------------------------------------------
@@ -252,6 +393,7 @@ def make_tf_dataset(
     batch_size, shuffle, augment=False, image_norm="imagenet",
     drop_remainder=False,
     repeat_forever=False,
+    is_hard_source=None,
 ):
     """Build tf.data pipeline from numpy arrays (no augmentation).
 
@@ -261,7 +403,11 @@ def make_tf_dataset(
     del augment  # Batch augmentation happens in the training loop.
     ds = tf.data.Dataset.from_tensor_slices((
         images,  # keep uint8, normalize lazily
-        {"coords": coords, "has_doc": has_doc},
+        {
+            "coords": coords,
+            "has_doc": has_doc,
+            **({"is_hard_source": is_hard_source} if is_hard_source is not None else {}),
+        },
     ))
     if shuffle:
         ds = ds.shuffle(
@@ -379,6 +525,16 @@ def parse_args():
                         help="Min best_iou before augmentation activates (0.0=immediate)")
     parser.add_argument("--aug_factor", type=int, default=1,
                         help="Virtual train multiplier via repeated stochastic views per epoch (1=default)")
+    parser.add_argument("--hard_selector_file", type=str, default=None,
+                        help="Path to a txt file describing hard source/sample selectors "
+                             "(see HARD_SELECTOR_FORMAT.md)")
+    parser.add_argument("--hard_selector_mix_weight", "--hard_source_mix_weight",
+                        dest="hard_selector_mix_weight", type=float, default=0.0,
+                        help="Fraction of train batches sampled from the hard-selector subset (0 disables)")
+    parser.add_argument("--report_val_hard", action="store_true",
+                        help="Report separate metrics on validation samples matched by --hard_selector_file")
+    parser.add_argument("--augment_selector_only", action="store_true",
+                        help="Apply geometric augmentation only to selector-matched samples")
 
     return parser.parse_args()
 
@@ -414,6 +570,7 @@ def resolve_effective_aug_factor(args):
 def main():
     args = parse_args()
     effective_aug_factor = resolve_effective_aug_factor(args)
+    hard_selectors = resolve_hard_selector_config(args)
     platform = setup_platform()
 
     output_dir = Path(args.output_dir)
@@ -431,27 +588,70 @@ def main():
 
     # Load data
     print("\n--- Data Loading ---")
-    train_images, train_coords, train_has_doc = load_dataset_fast(
-        args.data_root, "train", args.img_size, args.num_workers,
-    )
-    val_images, val_coords, val_has_doc = load_dataset_fast(
-        args.data_root, "val", args.img_size, args.num_workers,
-    )
+    need_names = bool(hard_selectors) or args.report_val_hard
+    if need_names:
+        train_images, train_coords, train_has_doc, train_names = load_dataset_fast(
+            args.data_root, "train", args.img_size, args.num_workers, return_names=True,
+        )
+        val_images, val_coords, val_has_doc, val_names = load_dataset_fast(
+            args.data_root, "val", args.img_size, args.num_workers, return_names=True,
+        )
+    else:
+        train_images, train_coords, train_has_doc = load_dataset_fast(
+            args.data_root, "train", args.img_size, args.num_workers,
+        )
+        val_images, val_coords, val_has_doc = load_dataset_fast(
+            args.data_root, "val", args.img_size, args.num_workers,
+        )
+        train_names = None
+        val_names = None
 
     n_train = len(train_images)
     n_val = len(val_images)
     base_train_steps = n_train // args.batch_size
     train_steps = base_train_steps * effective_aug_factor
     val_steps = math.ceil(n_val / args.batch_size)
-    repeat_train = effective_aug_factor > 1
+    train_hard_mask = None
+    val_hard_mask = None
+    mixed_hard = False
+
+    if hard_selectors:
+        train_hard_mask = build_hard_selector_mask(train_names, train_has_doc, hard_selectors)
+        val_hard_mask = build_hard_selector_mask(val_names, val_has_doc, hard_selectors)
+
+    repeat_train = effective_aug_factor > 1 or args.hard_selector_mix_weight > 0.0
 
     print(f"Creating train dataset ({n_train} images)...", end=" ", flush=True)
-    train_ds = make_tf_dataset(
+    base_train_ds = make_tf_dataset(
         train_images, train_coords, train_has_doc,
         args.batch_size, shuffle=True, image_norm=args.input_norm,
         drop_remainder=True,
         repeat_forever=repeat_train,
+        is_hard_source=train_hard_mask.astype(np.float32) if train_hard_mask is not None else None,
     )
+    train_ds = base_train_ds
+    if args.hard_selector_mix_weight > 0.0:
+        n_hard = int(train_hard_mask.sum())
+        if n_hard == 0:
+            print("no hard-selector samples found; disabling hard-selector mixing", flush=True)
+            args.hard_selector_mix_weight = 0.0
+        else:
+            hard_train_ds = make_tf_dataset(
+                train_images[train_hard_mask],
+                train_coords[train_hard_mask],
+                train_has_doc[train_hard_mask],
+                args.batch_size,
+                shuffle=True,
+                image_norm=args.input_norm,
+                drop_remainder=True,
+                repeat_forever=True,
+                is_hard_source=np.ones(n_hard, dtype=np.float32),
+            )
+            train_ds = tf.data.Dataset.sample_from_datasets(
+                [base_train_ds, hard_train_ds],
+                weights=[1.0 - args.hard_selector_mix_weight, args.hard_selector_mix_weight],
+            ).prefetch(tf.data.AUTOTUNE)
+            mixed_hard = True
     print("done", flush=True)
 
     print(f"Creating val dataset ({n_val} images)...", end=" ", flush=True)
@@ -459,6 +659,7 @@ def main():
         val_images, val_coords, val_has_doc,
         args.batch_size, shuffle=False, image_norm=args.input_norm,
         repeat_forever=False,
+        is_hard_source=val_hard_mask.astype(np.float32) if val_hard_mask is not None else None,
     )
     print("done", flush=True)
 
@@ -537,6 +738,16 @@ def main():
               f"(base_steps={base_train_steps}/ep -> effective_steps={train_steps}/ep)")
     else:
         print(f"  Aug factor: 1x (default)")
+    if hard_selectors:
+        train_hard_count = int(train_hard_mask.sum())
+        val_hard_count = int(val_hard_mask.sum())
+        print(f"  Hard sel:  file={args.hard_selector_file} mix={args.hard_selector_mix_weight:.2f} "
+              f"train_pos={train_hard_count} val_pos={val_hard_count}")
+        print(f"  Hard sel definitions: {format_hard_selector_summary(hard_selectors)}")
+        if mixed_hard:
+            print(f"  Hard sel preview: {preview_hard_selector_values(hard_selectors)}")
+    if args.augment_selector_only:
+        print("  Aug sel:   geometry limited to selector-matched samples")
     print(f"  Steps:    {train_steps}/ep train, {val_steps}/ep val")
     if args.augment:
         print(f"  Augment:  rotation={args.rotation_range}\u00b0 scale={args.scale_range} "
@@ -598,6 +809,7 @@ def main():
             if aug_active:
                 coords = targets["coords"]
                 has_doc = targets["has_doc"]
+                aug_mask = targets.get("is_hard_source") if args.augment_selector_only else None
                 if use_weak_aug:
                     images = tf_augment_color_only(images, image_norm=args.input_norm)
                 else:
@@ -607,8 +819,13 @@ def main():
                         image_norm=args.input_norm,
                         rotation_range=args.rotation_range,
                         scale_range=args.scale_range,
+                        aug_mask=aug_mask,
                     )
-                targets = {"coords": coords, "has_doc": has_doc}
+                targets = {
+                    "coords": coords,
+                    "has_doc": has_doc,
+                    **({"is_hard_source": aug_mask} if aug_mask is not None else {}),
+                }
             trainer.train_step((images, targets))
             train_pbar.set_postfix(loss=f"{float(trainer.loss_tracker.result()):.4f}")
         train_pbar.close()
@@ -617,6 +834,7 @@ def main():
         # Validate
         trainer.reset_metrics()
         val_metrics.reset()
+        val_hard_metrics = ValidationMetrics(img_size=args.img_size) if args.report_val_hard else None
         val_pbar = tqdm(val_ds, total=val_steps,
                         desc=f"  Epoch {epoch}/{args.epochs} [Val]  ",
                         leave=False, ncols=100)
@@ -629,10 +847,22 @@ def main():
                 coords_pred, targets["coords"].numpy(),
                 score_pred, targets["has_doc"].numpy(),
             )
+            if val_hard_metrics is not None and "is_hard_source" in targets:
+                hard_mask_batch = targets["is_hard_source"].numpy() > 0.5
+                if np.any(hard_mask_batch):
+                    val_hard_metrics.update(
+                        coords_pred[hard_mask_batch],
+                        targets["coords"].numpy()[hard_mask_batch],
+                        score_pred[hard_mask_batch],
+                        targets["has_doc"].numpy()[hard_mask_batch],
+                    )
             val_pbar.set_postfix(loss=f"{float(trainer.loss_tracker.result()):.4f}")
         val_pbar.close()
         val_m = {k: float(v) for k, v in trainer._get_metrics_dict().items()}
         detailed = val_metrics.compute()
+        detailed_hard = None
+        if val_hard_metrics is not None and val_hard_metrics.pred_coords_list:
+            detailed_hard = val_hard_metrics.compute()
 
         epoch_time = time.time() - t0
         iou = detailed["mean_iou"]
@@ -745,6 +975,12 @@ def main():
               f"  acc={detailed['cls_accuracy']*100:.2f}%"
               f"  (TP={detailed['cls_tp']} FP={detailed['cls_fp']}"
               f" FN={detailed['cls_fn']} TN={detailed['cls_tn']})")
+        if detailed_hard is not None:
+            print(f"  |- ValHard    n={detailed_hard['num_with_doc']}"
+                  f"  iou={detailed_hard['mean_iou']:.4f}"
+                  f"  med={detailed_hard['median_iou']:.4f}"
+                  f"  err={detailed_hard['corner_error_px']:.2f}px"
+                  f"  @95={detailed_hard['recall_95']*100:.2f}%")
         print(f"  '- LR         {lr_now:.2e}{_lr_delta(lr_now, prev_lr)}")
 
         # Update prev values for next epoch
@@ -768,6 +1004,11 @@ def main():
             "val_recall_99": detailed["recall_99"],
             "val_cls_f1": detailed["cls_f1"],
             "val_cls_accuracy": detailed["cls_accuracy"],
+            "val_hard_mean_iou": detailed_hard["mean_iou"] if detailed_hard is not None else None,
+            "val_hard_median_iou": detailed_hard["median_iou"] if detailed_hard is not None else None,
+            "val_hard_corner_error_px": detailed_hard["corner_error_px"] if detailed_hard is not None else None,
+            "val_hard_recall_95": detailed_hard["recall_95"] if detailed_hard is not None else None,
+            "val_hard_num_with_doc": detailed_hard["num_with_doc"] if detailed_hard is not None else None,
             "lr": lr_now,
             "loss_gap": gap,
             "epoch_time": epoch_time,

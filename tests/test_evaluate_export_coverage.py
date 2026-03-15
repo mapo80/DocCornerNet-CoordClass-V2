@@ -317,3 +317,20 @@ class TestLoadDatasetFast:
 
         images, coords, has_doc = load_dataset_fast(str(tmp_path), "train", 64, num_workers=1)
         assert len(images) == 1
+
+    def test_return_names(self, tmp_path):
+        (tmp_path / "images").mkdir()
+        (tmp_path / "labels").mkdir()
+        for name in ["img_0.jpg", "img_1.jpg"]:
+            img = Image.new("RGB", (32, 32))
+            img.save(tmp_path / "images" / name)
+            with open(tmp_path / "labels" / f"{Path(name).stem}.txt", "w") as f:
+                f.write("0 0.1 0.1 0.9 0.1 0.9 0.9 0.1 0.9\n")
+        with open(tmp_path / "train.txt", "w") as f:
+            f.write("img_0.jpg\nimg_1.jpg\n")
+
+        images, coords, has_doc, names = load_dataset_fast(
+            str(tmp_path), "train", 64, num_workers=1, return_names=True,
+        )
+        assert images.shape[0] == 2
+        assert list(names) == ["img_0.jpg", "img_1.jpg"]

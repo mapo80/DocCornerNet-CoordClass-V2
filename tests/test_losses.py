@@ -255,3 +255,41 @@ class TestDocCornerNetV2Trainer:
         iou, err = trainer._compute_geometry_metrics(pred, gt, mask)
         assert iou.numpy() == pytest.approx(1.0, abs=1e-5)
         assert err.numpy() == pytest.approx(0.0, abs=1e-5)
+
+    def test_train_step_falls_back_to_eager_on_compiled_error(self, trainer, monkeypatch):
+        x, y = self._make_batch()
+        calls = {"count": 0}
+
+        def failing_train_body(*args, **kwargs):
+            calls["count"] += 1
+            raise tf.errors.InvalidArgumentError(None, None, "compiled train failure")
+
+        monkeypatch.setattr(trainer, "_compiled_train_body", failing_train_body)
+        metrics = trainer.train_step((x, y))
+
+        assert "loss" in metrics
+        assert trainer._disable_compiled_train_body is True
+        assert calls["count"] == 1
+
+        trainer.train_step((x, y))
+        assert calls["count"] == 1
+
+    def test_test_step_falls_back_to_eager_on_compiled_error(self, trainer, monkeypatch):
+        x, y = self._make_batch()
+        calls = {"count": 0}
+
+        def failing_test_body(*args, **kwargs):
+            calls["count"] += 1
+            raise tf.errors.InvalidArgumentError(None, None, "compiled test failure")
+
+        monkeypatch.setattr(trainer, "_compiled_test_body", failing_test_body)
+        metrics, out_coords, out_score_logit = trainer.test_step((x, y))
+
+        assert "loss" in metrics
+        assert out_coords.shape[-1] == 8
+        assert out_score_logit.shape[-1] == 1
+        assert trainer._disable_compiled_test_body is True
+        assert calls["count"] == 1
+
+        trainer.test_step((x, y))
+        assert calls["count"] == 1

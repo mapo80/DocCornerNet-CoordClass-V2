@@ -17,8 +17,13 @@ from losses import DocCornerNetV2Trainer
 from metrics import ValidationMetrics
 from train_ultra import (
     WarmupCosineSchedule,
+    build_hard_selector_mask,
+    extract_source_name,
+    format_hard_selector_summary,
+    load_hard_selector_file,
     make_tf_dataset,
     resolve_effective_aug_factor,
+    resolve_hard_selector_config,
     should_activate_augmentation,
 )
 from export import (
@@ -170,6 +175,114 @@ class TestResolveEffectiveAugFactor:
         assert resolve_effective_aug_factor(args) == 3
 
 
+class TestHardSelectorHelpers:
+    def test_extract_source_name(self):
+        assert extract_source_name("idcard_jj_004845.jpg") == "idcard_jj"
+        assert extract_source_name("nested/path/receipt_occam_000052.jpg") == "receipt_occam"
+
+    def test_load_hard_selector_file(self, tmp_path):
+        selector_file = tmp_path / "hard.txt"
+        selector_file.write_text(
+            "\n".join([
+                "# comment",
+                "idcard_jj",
+                "source:receipt_occam",
+                "sample:receipt_occam_000052.jpg",
+            ]),
+            encoding="utf-8",
+        )
+        selectors = load_hard_selector_file(selector_file)
+        assert selectors["sources"] == {"idcard_jj", "receipt_occam"}
+        assert selectors["samples"] == {"receipt_occam_000052.jpg"}
+
+    def test_build_hard_selector_mask(self):
+        names = np.array([
+            "idcard_jj_000001.jpg",
+            "midv500_000123.jpg",
+            "receipts_segmentation_000002.jpg",
+            "negative_example_000003.jpg",
+            "custom_case_000004.jpg",
+        ], dtype=object)
+        has_doc = np.array([1.0, 1.0, 1.0, 0.0, 1.0], dtype=np.float32)
+        selectors = {
+            "sources": {"idcard_jj", "receipts_segmentation"},
+            "samples": {"custom_case_000004.jpg"},
+        }
+        mask = build_hard_selector_mask(names, has_doc, selectors)
+        np.testing.assert_array_equal(mask, np.array([True, False, True, False, True]))
+
+    def test_format_hard_selector_summary(self):
+        selectors = {"sources": {"idcard_jj"}, "samples": {"sample_a.jpg", "sample_b.jpg"}}
+        assert format_hard_selector_summary(selectors) == "sources=1, samples=2"
+
+    def test_resolve_hard_selector_config_valid(self, tmp_path):
+        selector_file = tmp_path / "hard.txt"
+        selector_file.write_text("idcard_jj\nsample:foo.jpg\n", encoding="utf-8")
+        args = SimpleNamespace(
+            hard_selector_file=str(selector_file),
+            hard_selector_mix_weight=0.25,
+            report_val_hard=True,
+        )
+        selectors = resolve_hard_selector_config(args)
+        assert "idcard_jj" in selectors["sources"]
+        assert "foo.jpg" in selectors["samples"]
+
+    def test_resolve_hard_selector_config_requires_file(self):
+        args = SimpleNamespace(
+            hard_selector_file=None,
+            hard_selector_mix_weight=0.25,
+            report_val_hard=False,
+        )
+        with pytest.raises(ValueError, match="requires --hard_selector_file"):
+            resolve_hard_selector_config(args)
+
+    def test_resolve_hard_selector_config_requires_file_for_val_report(self):
+        args = SimpleNamespace(
+            hard_selector_file=None,
+            hard_selector_mix_weight=0.0,
+            report_val_hard=True,
+        )
+        with pytest.raises(ValueError, match="requires --hard_selector_file"):
+            resolve_hard_selector_config(args)
+
+    def test_resolve_hard_selector_config_rejects_empty_file(self, tmp_path):
+        selector_file = tmp_path / "empty.txt"
+        selector_file.write_text("# only comments\n", encoding="utf-8")
+        args = SimpleNamespace(
+            hard_selector_file=str(selector_file),
+            hard_selector_mix_weight=0.0,
+            report_val_hard=True,
+            augment=False,
+            augment_selector_only=False,
+        )
+        with pytest.raises(ValueError, match="did not define any selectors"):
+            resolve_hard_selector_config(args)
+
+    def test_resolve_hard_selector_config_requires_file_for_selector_only(self):
+        args = SimpleNamespace(
+            hard_selector_file=None,
+            hard_selector_mix_weight=0.0,
+            report_val_hard=False,
+            augment=True,
+            augment_selector_only=True,
+        )
+        with pytest.raises(ValueError, match="requires --hard_selector_file"):
+            resolve_hard_selector_config(args)
+
+    def test_resolve_hard_selector_config_requires_augment_for_selector_only(self, tmp_path):
+        selector_file = tmp_path / "hard.txt"
+        selector_file.write_text("idcard_jj\n", encoding="utf-8")
+        args = SimpleNamespace(
+            hard_selector_file=str(selector_file),
+            hard_selector_mix_weight=0.0,
+            report_val_hard=False,
+            augment=False,
+            augment_selector_only=True,
+        )
+        with pytest.raises(ValueError, match="requires --augment"):
+            resolve_hard_selector_config(args)
+
+
 class TestTrainingSmoke:
     def test_full_training_step(self):
         """End-to-end: build model, create trainer, run one training step."""
@@ -238,6 +351,21 @@ class TestTrainingSmoke:
         # Verify coords pass through unmodified
         np.testing.assert_allclose(
             targets["coords"].numpy(), coords, atol=1e-6)
+
+    def test_validation_targets_can_carry_hard_flag(self):
+        N = 4
+        images = np.random.randint(0, 255, (N, 32, 32, 3), dtype=np.uint8)
+        coords = np.zeros((N, 8), dtype=np.float32)
+        has_doc = np.ones(N, dtype=np.float32)
+        is_hard = np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float32)
+        ds = make_tf_dataset(
+            images, coords, has_doc,
+            batch_size=2, shuffle=False,
+            is_hard_source=is_hard,
+        )
+        for _, targets in ds.take(1):
+            assert "is_hard_source" in targets
+            assert targets["is_hard_source"].shape == (2,)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,20 @@
+# Example hard selector file for train_ultra.py
+# Bare lines are treated as source selectors.
+
+idcard_final_polygon
+idcard_jj
+idcard_g2wbl
+segrec
+
+# Explicit syntax also works.
+source:receipt_occam
+source:receipt_segmentation_z4vqo
+source:receipts_segmentation
+source:receipts_coolstuff
+source:seg_paper
+source:documents_segmentation
+source:book_page_segmentation_tecgp
+source:midv2019
+
+# Exact sample selectors are optional and can be mixed in.
+# sample:receipt_occam_000123.jpg

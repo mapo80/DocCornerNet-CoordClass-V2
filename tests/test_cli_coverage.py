@@ -103,6 +103,8 @@ class TestTrainParseArgs:
             assert args.epochs == 100
             assert args.batch_size == 32
             assert args.aug_factor == 1
+            assert args.hard_selector_file is None
+            assert args.augment_selector_only is False
 
     def test_parse_args_custom(self):
         with patch("sys.argv", [
@@ -114,12 +116,20 @@ class TestTrainParseArgs:
             "--backbone_weights", "none",
             "--augment",
             "--aug_factor", "3",
+            "--hard_selector_file", "/tmp/hard.txt",
+            "--hard_source_mix_weight", "0.25",
+            "--report_val_hard",
+            "--augment_selector_only",
         ]):
             args = train_mod.parse_args()
             assert args.epochs == 5
             assert args.sigma_px == 3.0
             assert args.init_weights == "/tmp/w.h5"
             assert args.aug_factor == 3
+            assert args.hard_selector_file == "/tmp/hard.txt"
+            assert args.hard_selector_mix_weight == 0.25
+            assert args.report_val_hard is True
+            assert args.augment_selector_only is True
 
 
 class TestTrainSetupPlatform:

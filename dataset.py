@@ -123,7 +123,7 @@ def augment_sample(
 # TensorFlow batch augmentation (GPU-accelerated)
 # ---------------------------------------------------------------------------
 
-def _tf_rotate_batch(images, coords, has_doc, rotation_range):
+def _tf_rotate_batch(images, coords, has_doc, rotation_range, aug_mask=None):
     """Apply random rotation to a batch using TF ops.
 
     Args:
@@ -141,6 +141,8 @@ def _tf_rotate_batch(images, coords, has_doc, rotation_range):
 
     # Random angles in radians
     angles = tf.random.uniform([batch_size], -rotation_range, rotation_range) * (3.14159265 / 180.0)
+    if aug_mask is not None:
+        angles = angles * tf.cast(tf.reshape(aug_mask, [batch_size]), tf.float32)
     cos_a = tf.cos(angles)
     sin_a = tf.sin(angles)
 
@@ -176,13 +178,15 @@ def _tf_rotate_batch(images, coords, has_doc, rotation_range):
 
     # Only rotate positive samples' coords
     has_doc_mask = tf.cast(tf.reshape(has_doc > 0.5, [-1, 1]), tf.float32)
+    if aug_mask is not None:
+        has_doc_mask *= tf.cast(tf.reshape(aug_mask > 0.5, [-1, 1]), tf.float32)
     coords = coords * (1.0 - has_doc_mask) + new_coords * has_doc_mask
     coords = tf.clip_by_value(coords, 0.0, 1.0)
 
     return images, coords
 
 
-def _tf_scale_batch(images, coords, has_doc, scale_range):
+def _tf_scale_batch(images, coords, has_doc, scale_range, aug_mask=None):
     """Apply random scale augmentation to batch (zoom-out only).
 
     Scale range 0.15 means uniform scale in [0.85, 1.0].
@@ -196,6 +200,9 @@ def _tf_scale_batch(images, coords, has_doc, scale_range):
 
     # Random scale per sample (zoom-out only: scale in [1-range, 1.0])
     scales = tf.random.uniform([batch_size], 1.0 - scale_range, 1.0)
+    if aug_mask is not None:
+        aug_mask_1d = tf.cast(tf.reshape(aug_mask > 0.5, [batch_size]), tf.float32)
+        scales = 1.0 + (scales - 1.0) * aug_mask_1d
 
     has_doc_1d = tf.cast(tf.reshape(has_doc > 0.5, [batch_size]), tf.float32)
 
@@ -210,6 +217,8 @@ def _tf_scale_batch(images, coords, has_doc, scale_range):
     coords_max = tf.reduce_max(new_coords_4x2, axis=[1, 2])
     valid = tf.cast((coords_min >= 0.0) & (coords_max <= 1.0), tf.float32)
     apply_mask = valid * has_doc_1d
+    if aug_mask is not None:
+        apply_mask *= tf.cast(tf.reshape(aug_mask > 0.5, [batch_size]), tf.float32)
 
     # Transform images using crop-and-resize
     half_h = 0.5 / scales
@@ -238,7 +247,7 @@ def _tf_scale_batch(images, coords, has_doc, scale_range):
 
 def tf_augment_batch(images, coords, has_doc, img_size=224,
                      image_norm="imagenet", rotation_range=5.0,
-                     scale_range=0.0):
+                     scale_range=0.0, aug_mask=None):
     """Apply augmentation to a batch using TensorFlow ops (GPU-accelerated).
 
     Args:
@@ -248,7 +257,9 @@ def tf_augment_batch(images, coords, has_doc, img_size=224,
         img_size: Image size
         image_norm: Normalization mode ("imagenet", "zero_one", "raw255")
         rotation_range: Max rotation in degrees (0.0 = disabled)
-        scale_range: Scale range (0.15 means 0.85x-1.15x, 0.0 = disabled)
+        scale_range: Scale range (0.15 means 0.85x-1.0x, 0.0 = disabled)
+        aug_mask: Optional [B] mask. Geometric augmentation is only applied
+            where aug_mask > 0.5. Photometric augmentation remains global.
 
     Returns:
         augmented_images: [B, H, W, 3] float32
@@ -299,6 +310,8 @@ def tf_augment_batch(images, coords, has_doc, img_size=224,
 
     # --- Horizontal flip (50%) ---
     flip_mask = tf.random.uniform([batch_size]) > 0.5
+    if aug_mask is not None:
+        flip_mask = flip_mask & tf.cast(tf.reshape(aug_mask > 0.5, [batch_size]), tf.bool)
     flip_mask_img = tf.reshape(flip_mask, [batch_size, 1, 1, 1])
 
     images_flipped = tf.reverse(images, axis=[2])
@@ -325,9 +338,9 @@ def tf_augment_batch(images, coords, has_doc, img_size=224,
 
     # --- Geometric augmentations ---
     if rotation_range > 0:
-        images, coords = _tf_rotate_batch(images, coords, has_doc, rotation_range)
+        images, coords = _tf_rotate_batch(images, coords, has_doc, rotation_range, aug_mask=aug_mask)
     if scale_range > 0:
-        images, coords = _tf_scale_batch(images, coords, has_doc, scale_range)
+        images, coords = _tf_scale_batch(images, coords, has_doc, scale_range, aug_mask=aug_mask)
 
     return images, coords
 

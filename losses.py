@@ -241,6 +241,8 @@ class DocCornerNetV2Trainer(keras.Model):
         self.score_loss_tracker = keras.metrics.Mean(name="loss_score")
         self.iou_tracker = keras.metrics.Mean(name="iou")
         self.corner_err_tracker = keras.metrics.Mean(name="corner_err_px")
+        self._disable_compiled_train_body = False
+        self._disable_compiled_test_body = False
 
     @property
     def metrics(self):
@@ -325,7 +327,7 @@ class DocCornerNetV2Trainer(keras.Model):
                 outputs, has_doc, coords_gt,
             )
         grads = tape.gradient(loss, self.net.trainable_variables)
-        self.optimizer.apply_gradients(zip(grads, self.net.trainable_variables))
+        self._apply_gradients(grads)
         return loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred
 
     @tf.function
@@ -339,12 +341,55 @@ class DocCornerNetV2Trainer(keras.Model):
             coords_pred, outputs["coords"], outputs["score_logit"]
         )
 
+    def _apply_gradients(self, grads):
+        grad_var_pairs = [
+            (grad, var)
+            for grad, var in zip(grads, self.net.trainable_variables)
+            if grad is not None
+        ]
+        if grad_var_pairs:
+            self.optimizer.apply_gradients(grad_var_pairs)
+
+    def _eager_train_body(self, x, has_doc, coords_gt):
+        with tf.GradientTape() as tape:
+            outputs = self.net(x, training=True)
+            loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = self._compute_losses(
+                outputs, has_doc, coords_gt,
+            )
+        grads = tape.gradient(loss, self.net.trainable_variables)
+        self._apply_gradients(grads)
+        return loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred
+
+    def _eager_test_body(self, x, has_doc, coords_gt):
+        outputs = self.net(x, training=False)
+        loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = self._compute_losses(
+            outputs, has_doc, coords_gt,
+        )
+        return (
+            loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score,
+            coords_pred, outputs["coords"], outputs["score_logit"]
+        )
+
     def train_step(self, data):
         x, y = data
         has_doc, coords_gt = self._extract_targets(y)
-        loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = (
-            self._compiled_train_body(x, has_doc, coords_gt)
-        )
+        if self._disable_compiled_train_body:
+            loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = (
+                self._eager_train_body(x, has_doc, coords_gt)
+            )
+        else:
+            try:
+                loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = (
+                    self._compiled_train_body(x, has_doc, coords_gt)
+                )
+            except (tf.errors.InvalidArgumentError, tf.errors.InternalError) as exc:
+                # TensorFlow/MPS can intermittently fail inside the compiled path.
+                # Fall back to eager execution and keep the run alive.
+                self._disable_compiled_train_body = True
+                print(f"[trainer] compiled train step failed; falling back to eager mode: {exc}")
+                loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = (
+                    self._eager_train_body(x, has_doc, coords_gt)
+                )
         self._update_metrics(
             loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d,
             loss_score, coords_pred, coords_gt, has_doc,
@@ -354,9 +399,21 @@ class DocCornerNetV2Trainer(keras.Model):
     def test_step(self, data):
         x, y = data
         has_doc, coords_gt = self._extract_targets(y)
-        loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred, out_coords, out_score_logit = (
-            self._compiled_test_body(x, has_doc, coords_gt)
-        )
+        if self._disable_compiled_test_body:
+            loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred, out_coords, out_score_logit = (
+                self._eager_test_body(x, has_doc, coords_gt)
+            )
+        else:
+            try:
+                loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred, out_coords, out_score_logit = (
+                    self._compiled_test_body(x, has_doc, coords_gt)
+                )
+            except (tf.errors.InvalidArgumentError, tf.errors.InternalError) as exc:
+                self._disable_compiled_test_body = True
+                print(f"[trainer] compiled eval step failed; falling back to eager mode: {exc}")
+                loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred, out_coords, out_score_logit = (
+                    self._eager_test_body(x, has_doc, coords_gt)
+                )
         self._update_metrics(
             loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d,
             loss_score, coords_pred, coords_gt, has_doc,

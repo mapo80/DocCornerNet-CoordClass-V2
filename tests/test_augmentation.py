@@ -206,6 +206,48 @@ class TestScaleIdentity:
 
 
 # ---------------------------------------------------------------------------
+# Geometric augmentation masks
+# ---------------------------------------------------------------------------
+
+class TestAugmentMask:
+    def test_zero_mask_blocks_geometric_aug(self):
+        tf.random.set_seed(123)
+        images = tf.random.uniform([2, 64, 64, 3], -2.0, 2.0)
+        coords = tf.constant([
+            [0.2, 0.2, 0.8, 0.2, 0.8, 0.8, 0.2, 0.8],
+            [0.25, 0.25, 0.75, 0.25, 0.75, 0.75, 0.25, 0.75],
+        ], dtype=tf.float32)
+        has_doc = tf.ones([2], dtype=tf.float32)
+        aug_mask = tf.zeros([2], dtype=tf.float32)
+
+        _, out_coords = tf_augment_batch(
+            images, coords, has_doc,
+            rotation_range=10.0, scale_range=0.15,
+            aug_mask=aug_mask,
+        )
+
+        np.testing.assert_allclose(out_coords.numpy(), coords.numpy(), atol=1e-6)
+
+    def test_mixed_mask_preserves_unselected_sample(self):
+        tf.random.set_seed(123)
+        images = tf.random.uniform([2, 64, 64, 3], -2.0, 2.0)
+        coords = tf.constant([
+            [0.2, 0.2, 0.8, 0.2, 0.8, 0.8, 0.2, 0.8],
+            [0.25, 0.25, 0.75, 0.25, 0.75, 0.75, 0.25, 0.75],
+        ], dtype=tf.float32)
+        has_doc = tf.ones([2], dtype=tf.float32)
+        aug_mask = tf.constant([1.0, 0.0], dtype=tf.float32)
+
+        _, out_coords = tf_augment_batch(
+            images, coords, has_doc,
+            rotation_range=10.0, scale_range=0.15,
+            aug_mask=aug_mask,
+        )
+
+        np.testing.assert_allclose(out_coords[1].numpy(), coords[1].numpy(), atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
 # §11.7 — tf_augment_color_only does not modify coordinates
 # ---------------------------------------------------------------------------
 
