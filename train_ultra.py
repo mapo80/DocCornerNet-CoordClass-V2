@@ -42,6 +42,7 @@ from metrics import ValidationMetrics
 
 _SOURCE_SUFFIX_RE = re.compile(r"_(\d+)\.[^.]+$")
 _HARD_SELECTOR_PREFIXES = {"source", "sample"}
+_WEIGHT_RULE_PREFIXES = {"source", "sample"}
 
 
 # --------------------------------------------------------------------------
@@ -305,6 +306,67 @@ def load_hard_selector_file(path):
     return selectors
 
 
+def load_selector_weight_file(path):
+    """Load source/sample weighting rules from a plain-text file."""
+    weight_path = Path(path)
+    if not weight_path.exists():
+        raise ValueError(f"Selector weight file not found: {weight_path}")
+
+    rules = {"sources": {}, "samples": {}, "negative": None}
+    with weight_path.open("r", encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise ValueError(
+                    f"Malformed selector weight in {weight_path}:{line_no}. "
+                    "Expected '<selector>=<weight>'."
+                )
+
+            selector_text, weight_text = line.split("=", 1)
+            selector_text = selector_text.strip()
+            weight_text = weight_text.strip()
+            if not selector_text or not weight_text:
+                raise ValueError(f"Malformed selector weight in {weight_path}:{line_no}")
+
+            try:
+                weight = float(weight_text)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid weight '{weight_text}' in {weight_path}:{line_no}"
+                ) from exc
+            if weight <= 0.0:
+                raise ValueError(f"Selector weights must be > 0 in {weight_path}:{line_no}")
+
+            lowered = selector_text.lower()
+            if lowered == "negative":
+                rules["negative"] = weight
+                continue
+
+            kind = "source"
+            value = selector_text
+            if ":" in selector_text:
+                prefix, suffix = selector_text.split(":", 1)
+                kind = prefix.strip().lower()
+                value = suffix.strip()
+                if kind not in _WEIGHT_RULE_PREFIXES:
+                    raise ValueError(
+                        f"Unsupported weight selector prefix '{prefix}' in {weight_path}:{line_no}. "
+                        "Use 'source:' or 'sample:'."
+                    )
+
+            if not value:
+                raise ValueError(f"Empty weight selector in {weight_path}:{line_no}")
+
+            if kind == "source":
+                rules["sources"][value] = weight
+            else:
+                rules["samples"][Path(value).name] = weight
+
+    return rules
+
+
 def build_hard_selector_mask(sample_names, has_doc, selectors):
     """Mark positive samples matched by the configured hard selectors."""
     if sample_names is None:
@@ -330,11 +392,98 @@ def build_hard_selector_mask(sample_names, has_doc, selectors):
     return (has_doc.astype(np.float32) > 0.5) & match
 
 
+def build_selector_sample_weights(
+    sample_names,
+    has_doc,
+    weight_rules=None,
+    source_balance_power=0.0,
+    source_balance_cap=4.0,
+):
+    """Build normalized per-sample weights from source-frequency and file rules."""
+    if sample_names is None:
+        raise ValueError("sample_names are required for selector-based sample weights")
+    if source_balance_power < 0.0:
+        raise ValueError("source_balance_power must be >= 0")
+    if source_balance_cap <= 0.0:
+        raise ValueError("source_balance_cap must be > 0")
+
+    sample_names = np.asarray(sample_names, dtype=object)
+    has_doc = np.asarray(has_doc, dtype=np.float32)
+    pos_mask = has_doc > 0.5
+    weights = np.ones(len(sample_names), dtype=np.float32)
+    normalized_names = np.asarray([Path(name).name for name in sample_names], dtype=object)
+    source_names = np.asarray([extract_source_name(name) for name in sample_names], dtype=object)
+
+    if source_balance_power > 0.0 and np.any(pos_mask):
+        pos_sources = source_names[pos_mask]
+        unique_sources, counts = np.unique(pos_sources, return_counts=True)
+        max_count = float(np.max(counts))
+        for source_name, count in zip(unique_sources, counts):
+            raw_weight = (max_count / float(count)) ** source_balance_power
+            clipped_weight = min(raw_weight, source_balance_cap)
+            weights[pos_mask & (source_names == source_name)] *= clipped_weight
+
+    if weight_rules:
+        for source_name, multiplier in weight_rules.get("sources", {}).items():
+            weights[source_names == source_name] *= multiplier
+        for sample_name, multiplier in weight_rules.get("samples", {}).items():
+            weights[normalized_names == sample_name] *= multiplier
+        negative_weight = weight_rules.get("negative")
+        if negative_weight is not None:
+            weights[~pos_mask] *= float(negative_weight)
+
+    mean_weight = float(np.mean(weights))
+    if mean_weight <= 0.0:
+        raise ValueError("selector sample weights collapsed to a non-positive mean")
+    weights /= mean_weight
+    return weights.astype(np.float32)
+
+
+def build_source_sampling_plan(sample_names, has_doc, sample_weights):
+    """Aggregate per-sample weights into source-level dataset sampling masses."""
+    if sample_names is None:
+        raise ValueError("sample_names are required for source sampling")
+
+    sample_names = np.asarray(sample_names, dtype=object)
+    has_doc = np.asarray(has_doc, dtype=np.float32)
+    sample_weights = np.asarray(sample_weights, dtype=np.float32)
+    pos_mask = has_doc > 0.5
+    neg_mask = ~pos_mask
+    source_names = np.asarray([extract_source_name(name) for name in sample_names], dtype=object)
+
+    plan = {"negative_mass": float(np.sum(sample_weights[neg_mask])), "sources": {}}
+    for source_name in np.unique(source_names[pos_mask]):
+        mask = pos_mask & (source_names == source_name)
+        mass = float(np.sum(sample_weights[mask]))
+        if mass > 0.0:
+            plan["sources"][source_name] = mass
+
+    total_mass = plan["negative_mass"] + sum(plan["sources"].values())
+    if total_mass <= 0.0:
+        raise ValueError("source sampling plan has zero total mass")
+    plan["negative_mass"] /= total_mass
+    for source_name in list(plan["sources"].keys()):
+        plan["sources"][source_name] /= total_mass
+    return plan
+
+
 def format_hard_selector_summary(selectors):
     """Return a short printable summary for the selector config."""
     if not selectors:
         return "sources=0 samples=0"
     return f"sources={len(selectors.get('sources', ()))}, samples={len(selectors.get('samples', ()))}"
+
+
+def format_selector_weight_summary(weight_rules):
+    """Return a short printable summary for selector weighting rules."""
+    if not weight_rules:
+        return "sources=0, samples=0, negative=default"
+    negative = "set" if weight_rules.get("negative") is not None else "default"
+    return (
+        f"sources={len(weight_rules.get('sources', ()))}, "
+        f"samples={len(weight_rules.get('samples', ()))}, "
+        f"negative={negative}"
+    )
 
 
 def preview_hard_selector_values(selectors, limit=8):
@@ -345,6 +494,28 @@ def preview_hard_selector_values(selectors, limit=8):
     if remaining > 0:
         preview.extend(f"sample:{value}" for value in sorted(selectors.get("samples", ()))[:remaining])
     total = len(selectors.get("sources", ())) + len(selectors.get("samples", ()))
+    suffix = " ..." if total > len(preview) else ""
+    return ", ".join(preview) + suffix if preview else "(none)"
+
+
+def preview_selector_weight_values(weight_rules, limit=8):
+    """Return a short human-readable preview of selector weight rules."""
+    preview = []
+    preview.extend(
+        f"source:{value}={weight_rules['sources'][value]:.2f}"
+        for value in sorted(weight_rules.get("sources", ()))[:limit]
+    )
+    remaining = max(0, limit - len(preview))
+    if remaining > 0:
+        preview.extend(
+            f"sample:{value}={weight_rules['samples'][value]:.2f}"
+            for value in sorted(weight_rules.get("samples", ()))[:remaining]
+        )
+    if weight_rules.get("negative") is not None and len(preview) < limit:
+        preview.append(f"negative={weight_rules['negative']:.2f}")
+    total = len(weight_rules.get("sources", ())) + len(weight_rules.get("samples", ()))
+    if weight_rules.get("negative") is not None:
+        total += 1
     suffix = " ..." if total > len(preview) else ""
     return ", ".join(preview) + suffix if preview else "(none)"
 
@@ -372,6 +543,24 @@ def resolve_hard_selector_config(args):
     return selectors
 
 
+def resolve_selector_weight_config(args):
+    """Validate selector-weighting arguments and load rules if configured."""
+    if args.source_balance_power < 0.0:
+        raise ValueError("--source_balance_power must be >= 0")
+    if args.source_balance_cap <= 0.0:
+        raise ValueError("--source_balance_cap must be > 0")
+
+    if not args.selector_weight_file:
+        if args.source_weight_sampling and args.source_balance_power <= 0.0:
+            raise ValueError("--source_weight_sampling requires --selector_weight_file or --source_balance_power > 0")
+        return None
+
+    rules = load_selector_weight_file(args.selector_weight_file)
+    if not rules["sources"] and not rules["samples"] and rules["negative"] is None:
+        raise ValueError(f"--selector_weight_file {args.selector_weight_file} did not define any weights")
+    return rules
+
+
 # --------------------------------------------------------------------------
 # tf.data pipeline builder
 # --------------------------------------------------------------------------
@@ -394,6 +583,7 @@ def make_tf_dataset(
     drop_remainder=False,
     repeat_forever=False,
     is_hard_source=None,
+    sample_weight=None,
 ):
     """Build tf.data pipeline from numpy arrays (no augmentation).
 
@@ -407,6 +597,7 @@ def make_tf_dataset(
             "coords": coords,
             "has_doc": has_doc,
             **({"is_hard_source": is_hard_source} if is_hard_source is not None else {}),
+            **({"sample_weight": sample_weight} if sample_weight is not None else {}),
         },
     ))
     if shuffle:
@@ -423,6 +614,73 @@ def make_tf_dataset(
     )
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
+
+
+def make_source_sampled_train_dataset(
+    images,
+    coords,
+    has_doc,
+    sample_names,
+    sample_weights,
+    batch_size,
+    image_norm="imagenet",
+    drop_remainder=True,
+    is_hard_source=None,
+):
+    """Build an infinite train dataset sampled by source mass instead of raw frequency."""
+    plan = build_source_sampling_plan(sample_names, has_doc, sample_weights)
+    sample_names = np.asarray(sample_names, dtype=object)
+    has_doc = np.asarray(has_doc, dtype=np.float32)
+    source_names = np.asarray([extract_source_name(name) for name in sample_names], dtype=object)
+
+    datasets = []
+    weights = []
+    summary = []
+
+    neg_mask = has_doc <= 0.5
+    if np.any(neg_mask) and plan["negative_mass"] > 0.0:
+        datasets.append(
+            make_tf_dataset(
+                images[neg_mask],
+                coords[neg_mask],
+                has_doc[neg_mask],
+                batch_size,
+                shuffle=True,
+                image_norm=image_norm,
+                drop_remainder=drop_remainder,
+                repeat_forever=True,
+                is_hard_source=is_hard_source[neg_mask] if is_hard_source is not None else None,
+                sample_weight=sample_weights[neg_mask],
+            )
+        )
+        weights.append(plan["negative_mass"])
+        summary.append(("negative", int(np.sum(neg_mask)), plan["negative_mass"]))
+
+    pos_mask = has_doc > 0.5
+    for source_name in sorted(plan["sources"].keys()):
+        src_mask = pos_mask & (source_names == source_name)
+        datasets.append(
+            make_tf_dataset(
+                images[src_mask],
+                coords[src_mask],
+                has_doc[src_mask],
+                batch_size,
+                shuffle=True,
+                image_norm=image_norm,
+                drop_remainder=drop_remainder,
+                repeat_forever=True,
+                is_hard_source=is_hard_source[src_mask] if is_hard_source is not None else None,
+                sample_weight=sample_weights[src_mask],
+            )
+        )
+        weights.append(plan["sources"][source_name])
+        summary.append((source_name, int(np.sum(src_mask)), plan["sources"][source_name]))
+
+    if not datasets:
+        raise ValueError("source-sampled dataset could not be built from the provided weights")
+
+    mixed = tf.data.Dataset.sample_from_datasets(datasets, weights=weights).prefetch(tf.data.AUTOTUNE)
+    return mixed, summary
 
 
 # --------------------------------------------------------------------------
@@ -535,6 +793,15 @@ def parse_args():
                         help="Report separate metrics on validation samples matched by --hard_selector_file")
     parser.add_argument("--augment_selector_only", action="store_true",
                         help="Apply geometric augmentation only to selector-matched samples")
+    parser.add_argument("--selector_weight_file", type=str, default=None,
+                        help="Path to a txt file defining source/sample loss weights "
+                             "(see SELECTOR_WEIGHT_FORMAT.md)")
+    parser.add_argument("--source_balance_power", type=float, default=0.0,
+                        help="Inverse-frequency exponent for positive source balancing (0 disables)")
+    parser.add_argument("--source_balance_cap", type=float, default=4.0,
+                        help="Maximum multiplier produced by --source_balance_power")
+    parser.add_argument("--source_weight_sampling", action="store_true",
+                        help="Sample train batches by source mass derived from selector weights / source balancing")
 
     return parser.parse_args()
 
@@ -571,6 +838,9 @@ def main():
     args = parse_args()
     effective_aug_factor = resolve_effective_aug_factor(args)
     hard_selectors = resolve_hard_selector_config(args)
+    selector_weight_rules = resolve_selector_weight_config(args)
+    if args.source_weight_sampling and args.hard_selector_mix_weight > 0.0:
+        raise ValueError("--source_weight_sampling cannot be combined with --hard_selector_mix_weight")
     platform = setup_platform()
 
     output_dir = Path(args.output_dir)
@@ -588,7 +858,13 @@ def main():
 
     # Load data
     print("\n--- Data Loading ---")
-    need_names = bool(hard_selectors) or args.report_val_hard
+    need_names = (
+        bool(hard_selectors)
+        or args.report_val_hard
+        or selector_weight_rules is not None
+        or args.source_balance_power > 0.0
+        or args.source_weight_sampling
+    )
     if need_names:
         train_images, train_coords, train_has_doc, train_names = load_dataset_fast(
             args.data_root, "train", args.img_size, args.num_workers, return_names=True,
@@ -614,21 +890,46 @@ def main():
     train_hard_mask = None
     val_hard_mask = None
     mixed_hard = False
+    train_sample_weights = None
+    source_sampling_summary = None
 
     if hard_selectors:
         train_hard_mask = build_hard_selector_mask(train_names, train_has_doc, hard_selectors)
         val_hard_mask = build_hard_selector_mask(val_names, val_has_doc, hard_selectors)
 
-    repeat_train = effective_aug_factor > 1 or args.hard_selector_mix_weight > 0.0
+    if selector_weight_rules is not None or args.source_balance_power > 0.0:
+        train_sample_weights = build_selector_sample_weights(
+            train_names,
+            train_has_doc,
+            weight_rules=selector_weight_rules,
+            source_balance_power=args.source_balance_power,
+            source_balance_cap=args.source_balance_cap,
+        )
+
+    repeat_train = effective_aug_factor > 1 or args.hard_selector_mix_weight > 0.0 or args.source_weight_sampling
 
     print(f"Creating train dataset ({n_train} images)...", end=" ", flush=True)
-    base_train_ds = make_tf_dataset(
-        train_images, train_coords, train_has_doc,
-        args.batch_size, shuffle=True, image_norm=args.input_norm,
-        drop_remainder=True,
-        repeat_forever=repeat_train,
-        is_hard_source=train_hard_mask.astype(np.float32) if train_hard_mask is not None else None,
-    )
+    if args.source_weight_sampling:
+        base_train_ds, source_sampling_summary = make_source_sampled_train_dataset(
+            train_images,
+            train_coords,
+            train_has_doc,
+            train_names,
+            train_sample_weights if train_sample_weights is not None else np.ones(n_train, dtype=np.float32),
+            args.batch_size,
+            image_norm=args.input_norm,
+            drop_remainder=True,
+            is_hard_source=train_hard_mask.astype(np.float32) if train_hard_mask is not None else None,
+        )
+    else:
+        base_train_ds = make_tf_dataset(
+            train_images, train_coords, train_has_doc,
+            args.batch_size, shuffle=True, image_norm=args.input_norm,
+            drop_remainder=True,
+            repeat_forever=repeat_train,
+            is_hard_source=train_hard_mask.astype(np.float32) if train_hard_mask is not None else None,
+            sample_weight=train_sample_weights,
+        )
     train_ds = base_train_ds
     if args.hard_selector_mix_weight > 0.0:
         n_hard = int(train_hard_mask.sum())
@@ -646,6 +947,7 @@ def main():
                 drop_remainder=True,
                 repeat_forever=True,
                 is_hard_source=np.ones(n_hard, dtype=np.float32),
+                sample_weight=train_sample_weights[train_hard_mask] if train_sample_weights is not None else None,
             )
             train_ds = tf.data.Dataset.sample_from_datasets(
                 [base_train_ds, hard_train_ds],
@@ -744,8 +1046,23 @@ def main():
         print(f"  Hard sel:  file={args.hard_selector_file} mix={args.hard_selector_mix_weight:.2f} "
               f"train_pos={train_hard_count} val_pos={val_hard_count}")
         print(f"  Hard sel definitions: {format_hard_selector_summary(hard_selectors)}")
-        if mixed_hard:
+        if mixed_hard or args.augment_selector_only:
             print(f"  Hard sel preview: {preview_hard_selector_values(hard_selectors)}")
+    if selector_weight_rules or args.source_balance_power > 0.0:
+        mean_w = float(np.mean(train_sample_weights)) if train_sample_weights is not None else 1.0
+        max_w = float(np.max(train_sample_weights)) if train_sample_weights is not None else 1.0
+        print(
+            f"  Weights:   file={args.selector_weight_file or '-'} "
+            f"balance_pow={args.source_balance_power:.2f} cap={args.source_balance_cap:.2f} "
+            f"mean={mean_w:.2f} max={max_w:.2f}"
+        )
+        if selector_weight_rules:
+            print(f"  Weight defs: {format_selector_weight_summary(selector_weight_rules)}")
+            print(f"  Weight prev: {preview_selector_weight_values(selector_weight_rules)}")
+    if source_sampling_summary is not None:
+        top_sources = sorted(source_sampling_summary, key=lambda item: item[2], reverse=True)[:8]
+        preview = ", ".join(f"{name}={mass:.3f}" for name, _, mass in top_sources)
+        print(f"  Src samp:  enabled ({preview})")
     if args.augment_selector_only:
         print("  Aug sel:   geometry limited to selector-matched samples")
     print(f"  Steps:    {train_steps}/ep train, {val_steps}/ep val")
@@ -810,6 +1127,7 @@ def main():
                 coords = targets["coords"]
                 has_doc = targets["has_doc"]
                 aug_mask = targets.get("is_hard_source") if args.augment_selector_only else None
+                sample_weight = targets.get("sample_weight")
                 if use_weak_aug:
                     images = tf_augment_color_only(images, image_norm=args.input_norm)
                 else:
@@ -825,6 +1143,7 @@ def main():
                     "coords": coords,
                     "has_doc": has_doc,
                     **({"is_hard_source": aug_mask} if aug_mask is not None else {}),
+                    **({"sample_weight": sample_weight} if sample_weight is not None else {}),
                 }
             trainer.train_step((images, targets))
             train_pbar.set_postfix(loss=f"{float(trainer.loss_tracker.result()):.4f}")

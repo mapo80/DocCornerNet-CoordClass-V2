@@ -1,8 +1,8 @@
 # DocCornerNet V2
 
-Document corner detection with **corner-specific spatial attention**. Detects the four corners of a document in an image and classifies whether a document is present.
+Document corner detection with **corner-specific spatial attention** and **explicit 2D refinement supervision**. Detects the four corners of a document in an image and classifies whether a document is present.
 
-496,343 parameters | 224x224 input | TFLite-ready
+600,963 parameters | 224x224 input | TFLite-ready
 
 ## Architecture
 
@@ -22,20 +22,69 @@ Shared SepConv2D precursor
     +--- att_TR --> p_fused * sigmoid(Conv2D(1,1))  -->  feat_TR
     +--- att_BR --> p_fused * sigmoid(Conv2D(1,1))  -->  feat_BR
     +--- att_BL --> p_fused * sigmoid(Conv2D(1,1))  -->  feat_BL
-                        |
-                        v
-              Per-corner: AxisMean(H->X, W->Y) -> Resize1D -> shared Conv1D head
-                        |
-                        v
-              4 x (x_logits, y_logits) [B, 4, num_bins]
-                        |
-                        v
-              SimCCDecode (soft-argmax)  -->  coords [B, 8]
+           |                                |
+           |                                +--> 2D branch:
+           |                                     heatmap logits [B,56,56,4]
+           |                                     local offsets [B,56,56,8]
+           |
+           +--> SimCC coarse path:
+                AxisMean(H->X, W->Y) -> Resize1D -> shared Conv1D head
+                4 x (x_logits, y_logits) [B, 4, num_bins]
+                SimCCDecode (soft-argmax) --> coarse coords [B, 8]
+                                           |
+                                           v
+                                HeatmapOffsetRefine --> coords [B, 8]
 
 Parallel: C5 -> GAP -> Dense(1) -> score_logit [B, 1]
 ```
 
-**Key idea**: each corner learns its own spatial attention map before axis marginalization, reducing ambiguity between the four corners while sharing the Conv1D classification weights.
+**Key idea**: each corner learns its own spatial attention map before axis marginalization, then a supervised 2D heatmap/offset branch refines the final coordinates. The current best model is this hybrid SimCC + 2D-refinement version.
+
+## Current Best Model
+
+Frozen reference model:
+
+- path: [`models/v2_best_full_current`](./models/v2_best_full_current)
+- weights: [`best_model.weights.h5`](./models/v2_best_full_current/best_model.weights.h5)
+- metadata: [`MODEL_INFO.md`](./models/v2_best_full_current/MODEL_INFO.md)
+
+Training provenance:
+
+- source run: `runs/v3_full_losssup_continue_20ep`
+- dataset: `dataset/DocCornerDataset`
+- backbone init: `imagenet`
+- core training config:
+  - `alpha=0.35`
+  - `fpn_ch=48`
+  - `simcc_ch=128`
+  - `img_size=224`
+  - `num_bins=224`
+  - `w_simcc=1.0`
+  - `w_coord=0.2`
+  - `w_heatmap=0.0`
+  - `w_coord2d=0.25`
+  - `w_score=1.0`
+
+Best validation checkpoint:
+
+- epoch: `17`
+- mean IoU: `0.9837`
+- median IoU: `0.9885`
+- corner error mean: `1.04 px`
+- corner error p95: `2.63 px`
+- recall@95: `96.6%`
+
+Known test evaluation of the same frozen checkpoint:
+
+- mean IoU: `0.8643`
+- median IoU: `0.9569`
+- corner error mean: `8.53 px`
+- corner error p95: `46.98 px`
+- recall@95: `52.8%`
+- classification accuracy: `97.5%`
+- classification F1: `98.6%`
+
+This is the current baseline to beat. Validation is very strong; test remains substantially harder.
 
 ## Requirements
 
@@ -47,6 +96,45 @@ Parallel: C5 -> GAP -> Dense(1) -> score_logit [B, 1]
 
 ```bash
 pip install tensorflow numpy pillow shapely pytest pytest-cov
+```
+
+## Quick Start
+
+Clone del repository:
+
+```bash
+git clone https://github.com/mapo80/DocCornerNet-CoordClass-V2.git
+cd DocCornerNet-CoordClass-V2
+```
+
+Installazione delle dipendenze:
+
+```bash
+pip install -r requirements.txt
+```
+
+Installazione di Git LFS (necessaria per il dataset Hugging Face):
+
+Su Debian/Ubuntu o in un container standard:
+
+```bash
+apt-get update
+apt-get install -y git-lfs
+git lfs install
+```
+
+Se `git lfs install` restituisce `git: 'lfs' is not a git command`, significa che `git-lfs` non e ancora installato e devi eseguire i comandi sopra.
+
+Checkout del dataset da Hugging Face:
+
+```bash
+git clone https://huggingface.co/datasets/mapo80/DocCornerDataset dataset/DocCornerDataset
+```
+
+Il dataset verra scaricato localmente in:
+
+```text
+dataset/DocCornerDataset
 ```
 
 ## Dataset Structure
@@ -78,6 +166,31 @@ dataset/
 
 Coordinates in label files are normalized to [0, 1]. Corner order: TL, TR, BR, BL.
 Negative image filenames must be prefixed with `negative_`.
+
+## Dataset Used
+
+Primary training/evaluation dataset used in the current experiments:
+
+- dataset: `DocCornerDataset-BestGeneralist`
+- local path: `dataset/DocCornerDataset`
+- source: https://huggingface.co/datasets/mapo80/DocCornerDataset
+- format used in practice: Hugging Face parquet split directories
+
+Dataset metadata from [`dataset_info.json`](../dataset/DocCornerDataset/dataset_info.json):
+
+- description:
+  - "Best generalist training data from doc-scanner-dataset-rev-new with train_clean_iter3_plus_hard_full, val_clean_iter3, and test splits."
+- license: `MIT`
+- total split sizes:
+  - `train`: `32,968`
+  - `validation`: `8,645`
+  - `test`: `6,652`
+
+Practical notes from the experiments:
+
+- `validation` is substantially easier than `test`
+- `test` contains more small-document cases and a heavier mix of harder source families
+- this gap is the main reason why a model can reach `val ~0.98` while still staying much lower on `test`
 
 ## Training
 
@@ -151,6 +264,43 @@ python -m train_ultra \
     --output_dir runs/v2_finetune \
     --epochs 50 \
     --init_weights runs/v2_experiment/best_model.weights.h5
+```
+
+Source-balanced full retraining from epoch 1:
+
+```bash
+python -m train_ultra \
+    --data_root /path/to/dataset \
+    --output_dir runs/v2_source_balance \
+    --epochs 20 \
+    --batch_size 8 \
+    --backbone_weights imagenet \
+    --fpn_ch 48 \
+    --simcc_ch 128 \
+    --w_heatmap 0.0 \
+    --w_coord2d 0.25 \
+    --source_balance_power 0.35 \
+    --source_balance_cap 3.0 \
+    --source_weight_sampling
+```
+
+Source-balanced retraining with explicit source/sample weights from file:
+
+```bash
+python -m train_ultra \
+    --data_root /path/to/dataset \
+    --output_dir runs/v2_source_balance_weighted \
+    --epochs 20 \
+    --batch_size 8 \
+    --backbone_weights imagenet \
+    --fpn_ch 48 \
+    --simcc_ch 128 \
+    --w_heatmap 0.0 \
+    --w_coord2d 0.25 \
+    --selector_weight_file selector_weights.example.txt \
+    --source_balance_power 0.35 \
+    --source_balance_cap 3.0 \
+    --source_weight_sampling
 ```
 
 ### Training Arguments
@@ -242,6 +392,36 @@ When `--augment` is active, the following augmentations are applied batch-wise o
 **Augmentation phases**: With all options enabled, training goes through: no aug (delayed start) -> full aug (geometric + photometric) -> weak aug (photometric only, final epochs).
 
 **Note**: `augment_sample()` in `dataset.py` is a PIL-based utility for offline/debug use only. It applies photometric augmentations but no geometric transforms. The training loop uses `tf_augment_batch()` exclusively.
+
+### Generic Hard Selectors And Source Balancing
+
+Two external text-file mechanisms are available and both are generic:
+
+1. **Binary selectors** for diagnostics / hard-subset continuation
+   - docs: [`HARD_SELECTOR_FORMAT.md`](./HARD_SELECTOR_FORMAT.md)
+   - example: [`hard_selectors.example.txt`](./hard_selectors.example.txt)
+
+2. **Weighted selectors** for full retraining / source balancing
+   - docs: [`SELECTOR_WEIGHT_FORMAT.md`](./SELECTOR_WEIGHT_FORMAT.md)
+   - example: [`selector_weights.example.txt`](./selector_weights.example.txt)
+
+Relevant CLI flags:
+
+| Argument | Default | Description | Notes |
+|---|---|---|---|
+| `--hard_selector_file` | `None` | External `source:` / `sample:` selector list | Used by `--hard_selector_mix_weight`, `--report_val_hard`, and `--augment_selector_only` |
+| `--hard_selector_mix_weight` | `0.0` | Fraction of batches sampled from the selector-matched subset | Best suited for experiments, not for final late-stage continuation |
+| `--report_val_hard` | `false` | Report a separate `ValHard` block on the validation subset matched by the selector file | Diagnostic only |
+| `--augment_selector_only` | `false` | Restrict geometric augmentation to selector-matched samples | Requires `--augment` and `--hard_selector_file` |
+| `--selector_weight_file` | `None` | External `source:` / `sample:` weighting rules | Parsed once at startup and applied generically |
+| `--source_balance_power` | `0.0` | Inverse-frequency exponent for automatic positive-source balancing | `0.3-0.5` is a conservative range |
+| `--source_balance_cap` | `4.0` | Maximum multiplier from automatic source balancing | Prevents very rare sources from dominating |
+| `--source_weight_sampling` | `false` | Sample batches by source mass instead of raw source frequency | Intended for full retraining from epoch 1 |
+
+Practical guidance:
+
+- `--hard_selector_*` is useful for analysis and targeted ablations.
+- `--selector_weight_file` + `--source_balance_power` + `--source_weight_sampling` is the first serious option when the goal is to improve `test` generalization, not just `validation`.
 
 ### Training Outputs
 
@@ -407,7 +587,7 @@ With coverage:
 python -m pytest tests/ --cov=. --cov-report=term-missing
 ```
 
-200 tests, 93% coverage.
+253 tests.
 
 ## Project Structure
 
@@ -420,10 +600,12 @@ v2/
   train_ultra.py    # Training script (cross-platform)
   evaluate.py       # Evaluation script
   export.py         # TFLite/SavedModel export + benchmarking
-  tests/            # 200 tests, 93% coverage
+  tests/            # 253 tests
   V2_PROPOSAL.md    # Original design proposal
   IMPLEMENTATION_NOTES.md
   IMPLEMENTATION_TRACEABILITY.md
+  HARD_SELECTOR_FORMAT.md
+  SELECTOR_WEIGHT_FORMAT.md
 ```
 
 ## Model Outputs
@@ -432,5 +614,8 @@ v2/
 |---|---|---|
 | `simcc_x` | `[B, 4, num_bins]` | X coordinate logits per corner |
 | `simcc_y` | `[B, 4, num_bins]` | Y coordinate logits per corner |
+| `corner_heatmap` | `[B, 56, 56, 4]` | Per-corner heatmap logits |
+| `corner_offset` | `[B, 56, 56, 8]` | Per-corner local offsets `(dx, dy)` |
+| `coords_2d` | `[B, 8]` | Direct decode from the 2D heatmap/offset branch |
 | `score_logit` | `[B, 1]` | Document presence logit |
-| `coords` | `[B, 8]` | Decoded normalized coordinates (x0,y0,...,x3,y3) |
+| `coords` | `[B, 8]` | Final refined normalized coordinates (x0,y0,...,x3,y3) |

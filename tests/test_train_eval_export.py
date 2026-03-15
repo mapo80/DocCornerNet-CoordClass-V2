@@ -17,13 +17,19 @@ from losses import DocCornerNetV2Trainer
 from metrics import ValidationMetrics
 from train_ultra import (
     WarmupCosineSchedule,
+    build_selector_sample_weights,
+    build_source_sampling_plan,
     build_hard_selector_mask,
     extract_source_name,
     format_hard_selector_summary,
+    format_selector_weight_summary,
     load_hard_selector_file,
+    load_selector_weight_file,
     make_tf_dataset,
+    make_source_sampled_train_dataset,
     resolve_effective_aug_factor,
     resolve_hard_selector_config,
+    resolve_selector_weight_config,
     should_activate_augmentation,
 )
 from export import (
@@ -123,6 +129,42 @@ class TestMakeTfDataset:
             batches[2][0].numpy(),
             atol=1e-6,
         )
+
+    def test_includes_sample_weight(self):
+        N = 4
+        images = np.random.randint(0, 255, (N, 8, 8, 3), dtype=np.uint8)
+        coords = np.zeros((N, 8), dtype=np.float32)
+        has_doc = np.ones(N, dtype=np.float32)
+        sample_weight = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        ds = make_tf_dataset(
+            images, coords, has_doc,
+            batch_size=2, shuffle=False,
+            sample_weight=sample_weight,
+        )
+        for _, targets in ds.take(1):
+            assert "sample_weight" in targets
+            np.testing.assert_allclose(targets["sample_weight"].numpy(), np.array([1.0, 2.0], dtype=np.float32))
+
+    def test_make_source_sampled_train_dataset(self):
+        N = 6
+        images = np.random.randint(0, 255, (N, 8, 8, 3), dtype=np.uint8)
+        coords = np.zeros((N, 8), dtype=np.float32)
+        has_doc = np.array([1, 1, 1, 1, 0, 0], dtype=np.float32)
+        names = np.array([
+            "midv500_000001.jpg",
+            "midv500_000002.jpg",
+            "idcard_jj_000001.jpg",
+            "idcard_jj_000002.jpg",
+            "negative_a.jpg",
+            "negative_b.jpg",
+        ], dtype=object)
+        sample_weights = np.array([1.0, 1.0, 3.0, 3.0, 1.0, 1.0], dtype=np.float32)
+        ds, summary = make_source_sampled_train_dataset(
+            images, coords, has_doc, names, sample_weights,
+            batch_size=2, image_norm="zero_one",
+        )
+        assert ds is not None
+        assert any(name == "idcard_jj" for name, _, _ in summary)
 
 
 class TestResolveEffectiveAugFactor:
@@ -235,6 +277,87 @@ class TestHardSelectorHelpers:
         )
         with pytest.raises(ValueError, match="requires --hard_selector_file"):
             resolve_hard_selector_config(args)
+
+
+class TestSelectorWeightHelpers:
+    def test_load_selector_weight_file(self, tmp_path):
+        weight_file = tmp_path / "weights.txt"
+        weight_file.write_text(
+            "\n".join([
+                "# comment",
+                "idcard_jj=2.5",
+                "source:receipt_occam=3.0",
+                "sample:receipt_occam_000052.jpg=4.0",
+                "negative=0.5",
+            ]),
+            encoding="utf-8",
+        )
+        rules = load_selector_weight_file(weight_file)
+        assert rules["sources"] == {"idcard_jj": 2.5, "receipt_occam": 3.0}
+        assert rules["samples"] == {"receipt_occam_000052.jpg": 4.0}
+        assert rules["negative"] == 0.5
+
+    def test_build_selector_sample_weights(self):
+        names = np.array([
+            "midv500_000001.jpg",
+            "idcard_jj_000001.jpg",
+            "idcard_jj_000002.jpg",
+            "receipt_occam_000052.jpg",
+            "negative_coco_train_000001.jpg",
+        ], dtype=object)
+        has_doc = np.array([1.0, 1.0, 1.0, 1.0, 0.0], dtype=np.float32)
+        rules = {
+            "sources": {"idcard_jj": 2.0},
+            "samples": {"receipt_occam_000052.jpg": 3.0},
+            "negative": 0.5,
+        }
+        weights = build_selector_sample_weights(
+            names, has_doc, weight_rules=rules, source_balance_power=0.5, source_balance_cap=4.0,
+        )
+        assert weights.shape == (5,)
+        assert weights[1] > weights[0]
+        assert weights[3] > weights[0]
+        assert weights[4] < weights[0]
+        assert np.mean(weights) == pytest.approx(1.0, abs=1e-6)
+
+    def test_build_source_sampling_plan(self):
+        names = np.array([
+            "midv500_000001.jpg",
+            "midv500_000002.jpg",
+            "idcard_jj_000001.jpg",
+            "negative_coco_train_000001.jpg",
+        ], dtype=object)
+        has_doc = np.array([1.0, 1.0, 1.0, 0.0], dtype=np.float32)
+        sample_weights = np.array([1.0, 1.0, 3.0, 1.0], dtype=np.float32)
+        plan = build_source_sampling_plan(names, has_doc, sample_weights)
+        assert plan["sources"]["idcard_jj"] > plan["sources"]["midv500"]
+        assert plan["negative_mass"] > 0.0
+
+    def test_format_selector_weight_summary(self):
+        rules = {"sources": {"idcard_jj": 2.0}, "samples": {"a.jpg": 3.0}, "negative": 0.5}
+        assert format_selector_weight_summary(rules) == "sources=1, samples=1, negative=set"
+
+    def test_resolve_selector_weight_config_valid(self, tmp_path):
+        weight_file = tmp_path / "weights.txt"
+        weight_file.write_text("idcard_jj=2.0\n", encoding="utf-8")
+        args = SimpleNamespace(
+            selector_weight_file=str(weight_file),
+            source_balance_power=0.0,
+            source_balance_cap=4.0,
+            source_weight_sampling=False,
+        )
+        rules = resolve_selector_weight_config(args)
+        assert rules["sources"]["idcard_jj"] == 2.0
+
+    def test_resolve_selector_weight_config_requires_input_for_sampling(self):
+        args = SimpleNamespace(
+            selector_weight_file=None,
+            source_balance_power=0.0,
+            source_balance_cap=4.0,
+            source_weight_sampling=True,
+        )
+        with pytest.raises(ValueError, match="requires --selector_weight_file or --source_balance_power > 0"):
+            resolve_selector_weight_config(args)
 
     def test_resolve_hard_selector_config_requires_file_for_val_report(self):
         args = SimpleNamespace(
@@ -366,6 +489,21 @@ class TestTrainingSmoke:
         for _, targets in ds.take(1):
             assert "is_hard_source" in targets
             assert targets["is_hard_source"].shape == (2,)
+
+    def test_validation_targets_can_carry_sample_weight(self):
+        N = 4
+        images = np.random.randint(0, 255, (N, 32, 32, 3), dtype=np.uint8)
+        coords = np.zeros((N, 8), dtype=np.float32)
+        has_doc = np.ones(N, dtype=np.float32)
+        sample_weight = np.array([1.0, 1.5, 2.0, 2.5], dtype=np.float32)
+        ds = make_tf_dataset(
+            images, coords, has_doc,
+            batch_size=2, shuffle=False,
+            sample_weight=sample_weight,
+        )
+        for _, targets in ds.take(1):
+            assert "sample_weight" in targets
+            assert targets["sample_weight"].shape == (2,)
 
 
 # ---------------------------------------------------------------------------

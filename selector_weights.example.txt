@@ -1,0 +1,23 @@
+# Example selector weight file for train_ultra.py
+# Bare lines with assignment are treated as source rules.
+
+idcard_jj=2.0
+idcard_g2wbl=2.0
+idcard_final_polygon=2.5
+segrec=1.8
+
+# Explicit syntax also works.
+source:receipt_occam=2.2
+source:receipt_segmentation_z4vqo=2.0
+source:receipts_segmentation=2.0
+source:receipts_coolstuff=2.0
+source:seg_paper=1.7
+source:documents_segmentation=1.7
+source:book_page_segmentation_tecgp=1.8
+source:midv2019=1.6
+
+# Optional per-sample overrides.
+# sample:receipt_occam_000123.jpg=3.0
+
+# Optional negative multiplier.
+# negative=0.75

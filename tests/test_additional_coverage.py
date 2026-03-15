@@ -226,8 +226,9 @@ class TestLossesEdgeCases:
             "has_doc": tf.constant([[1.0], [0.0]]),
             "coords": tf.random.uniform([2, 8]),
         }
-        has_doc, coords = trainer._extract_targets(y)
+        has_doc, coords, sample_weight = trainer._extract_targets(y)
         assert has_doc.shape == (2,)
+        assert sample_weight.shape == (2,)
 
     def test_trainer_get_metrics_dict_keys(self):
         net = create_model(backbone_weights=None)

@@ -85,7 +85,7 @@ class SimCCLoss(keras.layers.Layer):
         self.tau = tau
         self.label_smoothing = label_smoothing
 
-    def call(self, simcc_x, simcc_y, gt_coords, mask):
+    def call(self, simcc_x, simcc_y, gt_coords, mask, sample_weight=None):
         """
         Args:
             simcc_x: [B, 4, bins] predicted X logits
@@ -109,7 +109,8 @@ class SimCCLoss(keras.layers.Layer):
         ce_y = -tf.reduce_sum(target_y * log_pred_y, axis=-1)
 
         ce = tf.reduce_mean(ce_x + ce_y, axis=-1)  # [B]
-        loss = tf.reduce_sum(ce * mask) / (tf.reduce_sum(mask) + 1e-9)
+        effective_weight = mask if sample_weight is None else mask * sample_weight
+        loss = tf.reduce_sum(ce * effective_weight) / (tf.reduce_sum(effective_weight) + 1e-9)
         return loss
 
 
@@ -124,7 +125,7 @@ class HeatmapCELoss(keras.layers.Layer):
         self.tau = tau
         self.label_smoothing = label_smoothing
 
-    def call(self, heatmap_logits, gt_coords, mask):
+    def call(self, heatmap_logits, gt_coords, mask, sample_weight=None):
         height = self.height if self.height is not None else tf.shape(heatmap_logits)[1]
         width = self.width if self.width is not None else tf.shape(heatmap_logits)[2]
         gt_xy = tf.reshape(gt_coords, [-1, 4, 2])
@@ -143,7 +144,8 @@ class HeatmapCELoss(keras.layers.Layer):
 
         ce = -tf.reduce_sum(target * log_pred, axis=-1)
         ce = tf.reduce_mean(ce, axis=-1)
-        loss = tf.reduce_sum(ce * mask) / (tf.reduce_sum(mask) + 1e-9)
+        effective_weight = mask if sample_weight is None else mask * sample_weight
+        loss = tf.reduce_sum(ce * effective_weight) / (tf.reduce_sum(effective_weight) + 1e-9)
         return loss
 
 
@@ -154,7 +156,7 @@ class CoordLoss(keras.layers.Layer):
         super().__init__(**kwargs)
         self.loss_type = loss_type
 
-    def call(self, pred_coords, gt_coords, mask):
+    def call(self, pred_coords, gt_coords, mask, sample_weight=None):
         """
         Args:
             pred_coords: [B, 8]
@@ -175,7 +177,8 @@ class CoordLoss(keras.layers.Layer):
             loss_per_coord = tf.abs(pred_coords - gt_coords)
 
         loss_per_sample = tf.reduce_mean(loss_per_coord, axis=-1)
-        loss = tf.reduce_sum(loss_per_sample * mask) / (tf.reduce_sum(mask) + 1e-9)
+        effective_weight = mask if sample_weight is None else mask * sample_weight
+        loss = tf.reduce_sum(loss_per_sample * effective_weight) / (tf.reduce_sum(effective_weight) + 1e-9)
         return loss
 
 
@@ -265,9 +268,16 @@ class DocCornerNetV2Trainer(keras.Model):
         if len(has_doc.shape) == 2:
             has_doc = tf.squeeze(has_doc, axis=-1)
         coords_gt = tf.cast(y["coords"], tf.float32)
-        return has_doc, coords_gt
+        sample_weight = y.get("sample_weight")
+        if sample_weight is None:
+            sample_weight = tf.ones_like(has_doc, dtype=tf.float32)
+        else:
+            sample_weight = tf.cast(sample_weight, tf.float32)
+            if len(sample_weight.shape) == 2:
+                sample_weight = tf.squeeze(sample_weight, axis=-1)
+        return has_doc, coords_gt, sample_weight
 
-    def _compute_losses(self, outputs, has_doc, coords_gt):
+    def _compute_losses(self, outputs, has_doc, coords_gt, sample_weight):
         simcc_x = outputs["simcc_x"]
         simcc_y = outputs["simcc_y"]
         corner_heatmap = outputs["corner_heatmap"]
@@ -278,12 +288,12 @@ class DocCornerNetV2Trainer(keras.Model):
         loss_score = tf.nn.sigmoid_cross_entropy_with_logits(
             labels=has_doc[:, None], logits=score_logit,
         )
-        loss_score = tf.reduce_mean(loss_score)
+        loss_score = tf.reduce_sum(loss_score[:, 0] * sample_weight) / (tf.reduce_sum(sample_weight) + 1e-9)
 
-        loss_simcc = self.simcc_loss_fn(simcc_x, simcc_y, coords_gt, has_doc)
-        loss_coord = self.coord_loss_fn(coords_pred, coords_gt, has_doc)
-        loss_heatmap = self.heatmap_loss_fn(corner_heatmap, coords_gt, has_doc)
-        loss_coord2d = self.coord2d_loss_fn(coords_2d, coords_gt, has_doc)
+        loss_simcc = self.simcc_loss_fn(simcc_x, simcc_y, coords_gt, has_doc, sample_weight)
+        loss_coord = self.coord_loss_fn(coords_pred, coords_gt, has_doc, sample_weight)
+        loss_heatmap = self.heatmap_loss_fn(corner_heatmap, coords_gt, has_doc, sample_weight)
+        loss_coord2d = self.coord2d_loss_fn(coords_2d, coords_gt, has_doc, sample_weight)
 
         loss = (
             self.w_simcc * loss_simcc
@@ -320,21 +330,21 @@ class DocCornerNetV2Trainer(keras.Model):
         }
 
     @tf.function
-    def _compiled_train_body(self, x, has_doc, coords_gt):
+    def _compiled_train_body(self, x, has_doc, coords_gt, sample_weight):
         with tf.GradientTape() as tape:
             outputs = self.net(x, training=True)
             loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = self._compute_losses(
-                outputs, has_doc, coords_gt,
+                outputs, has_doc, coords_gt, sample_weight,
             )
         grads = tape.gradient(loss, self.net.trainable_variables)
         self._apply_gradients(grads)
         return loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred
 
     @tf.function
-    def _compiled_test_body(self, x, has_doc, coords_gt):
+    def _compiled_test_body(self, x, has_doc, coords_gt, sample_weight):
         outputs = self.net(x, training=False)
         loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = self._compute_losses(
-            outputs, has_doc, coords_gt,
+            outputs, has_doc, coords_gt, sample_weight,
         )
         return (
             loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score,
@@ -350,20 +360,20 @@ class DocCornerNetV2Trainer(keras.Model):
         if grad_var_pairs:
             self.optimizer.apply_gradients(grad_var_pairs)
 
-    def _eager_train_body(self, x, has_doc, coords_gt):
+    def _eager_train_body(self, x, has_doc, coords_gt, sample_weight):
         with tf.GradientTape() as tape:
             outputs = self.net(x, training=True)
             loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = self._compute_losses(
-                outputs, has_doc, coords_gt,
+                outputs, has_doc, coords_gt, sample_weight,
             )
         grads = tape.gradient(loss, self.net.trainable_variables)
         self._apply_gradients(grads)
         return loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred
 
-    def _eager_test_body(self, x, has_doc, coords_gt):
+    def _eager_test_body(self, x, has_doc, coords_gt, sample_weight):
         outputs = self.net(x, training=False)
         loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = self._compute_losses(
-            outputs, has_doc, coords_gt,
+            outputs, has_doc, coords_gt, sample_weight,
         )
         return (
             loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score,
@@ -372,15 +382,15 @@ class DocCornerNetV2Trainer(keras.Model):
 
     def train_step(self, data):
         x, y = data
-        has_doc, coords_gt = self._extract_targets(y)
+        has_doc, coords_gt, sample_weight = self._extract_targets(y)
         if self._disable_compiled_train_body:
             loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = (
-                self._eager_train_body(x, has_doc, coords_gt)
+                self._eager_train_body(x, has_doc, coords_gt, sample_weight)
             )
         else:
             try:
                 loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = (
-                    self._compiled_train_body(x, has_doc, coords_gt)
+                    self._compiled_train_body(x, has_doc, coords_gt, sample_weight)
                 )
             except (tf.errors.InvalidArgumentError, tf.errors.InternalError) as exc:
                 # TensorFlow/MPS can intermittently fail inside the compiled path.
@@ -388,7 +398,7 @@ class DocCornerNetV2Trainer(keras.Model):
                 self._disable_compiled_train_body = True
                 print(f"[trainer] compiled train step failed; falling back to eager mode: {exc}")
                 loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred = (
-                    self._eager_train_body(x, has_doc, coords_gt)
+                    self._eager_train_body(x, has_doc, coords_gt, sample_weight)
                 )
         self._update_metrics(
             loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d,
@@ -398,21 +408,21 @@ class DocCornerNetV2Trainer(keras.Model):
 
     def test_step(self, data):
         x, y = data
-        has_doc, coords_gt = self._extract_targets(y)
+        has_doc, coords_gt, sample_weight = self._extract_targets(y)
         if self._disable_compiled_test_body:
             loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred, out_coords, out_score_logit = (
-                self._eager_test_body(x, has_doc, coords_gt)
+                self._eager_test_body(x, has_doc, coords_gt, sample_weight)
             )
         else:
             try:
                 loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred, out_coords, out_score_logit = (
-                    self._compiled_test_body(x, has_doc, coords_gt)
+                    self._compiled_test_body(x, has_doc, coords_gt, sample_weight)
                 )
             except (tf.errors.InvalidArgumentError, tf.errors.InternalError) as exc:
                 self._disable_compiled_test_body = True
                 print(f"[trainer] compiled eval step failed; falling back to eager mode: {exc}")
                 loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d, loss_score, coords_pred, out_coords, out_score_logit = (
-                    self._eager_test_body(x, has_doc, coords_gt)
+                    self._eager_test_body(x, has_doc, coords_gt, sample_weight)
                 )
         self._update_metrics(
             loss, loss_simcc, loss_coord, loss_heatmap, loss_coord2d,

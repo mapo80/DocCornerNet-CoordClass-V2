@@ -182,6 +182,16 @@ class TestCoordLoss:
         # Only 1 sample contributes, all coords are 1.0 diff
         assert loss.numpy() == pytest.approx(1.0, abs=1e-5)
 
+    def test_sample_weighted(self):
+        loss_fn = CoordLoss(loss_type="l1")
+        pred = tf.constant([[0.0] * 8, [0.5] * 8], dtype=tf.float32)
+        gt = tf.constant([[1.0] * 8, [1.0] * 8], dtype=tf.float32)
+        mask = tf.constant([1.0, 1.0], dtype=tf.float32)
+        sample_weight = tf.constant([1.0, 3.0], dtype=tf.float32)
+        loss = loss_fn(pred, gt, mask, sample_weight)
+        expected = (1.0 * 1.0 + 0.5 * 3.0) / 4.0
+        assert loss.numpy() == pytest.approx(expected, abs=1e-5)
+
 
 class TestDocCornerNetV2Trainer:
     @pytest.fixture
@@ -245,6 +255,12 @@ class TestDocCornerNetV2Trainer:
             "coords": np.random.uniform(0.1, 0.9, (B, 8)).astype(np.float32),
         }
         metrics, _, _ = trainer.test_step((x, y))
+        assert "loss" in metrics
+
+    def test_sample_weight_target(self, trainer):
+        x, y = self._make_batch()
+        y["sample_weight"] = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        metrics = trainer.train_step((x, y))
         assert "loss" in metrics
 
     def test_geometry_metrics_computation(self, trainer):

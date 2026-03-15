@@ -105,6 +105,9 @@ class TestTrainParseArgs:
             assert args.aug_factor == 1
             assert args.hard_selector_file is None
             assert args.augment_selector_only is False
+            assert args.selector_weight_file is None
+            assert args.source_balance_power == 0.0
+            assert args.source_weight_sampling is False
 
     def test_parse_args_custom(self):
         with patch("sys.argv", [
@@ -120,6 +123,9 @@ class TestTrainParseArgs:
             "--hard_source_mix_weight", "0.25",
             "--report_val_hard",
             "--augment_selector_only",
+            "--selector_weight_file", "/tmp/weights.txt",
+            "--source_balance_power", "0.5",
+            "--source_weight_sampling",
         ]):
             args = train_mod.parse_args()
             assert args.epochs == 5
@@ -130,6 +136,9 @@ class TestTrainParseArgs:
             assert args.hard_selector_mix_weight == 0.25
             assert args.report_val_hard is True
             assert args.augment_selector_only is True
+            assert args.selector_weight_file == "/tmp/weights.txt"
+            assert args.source_balance_power == 0.5
+            assert args.source_weight_sampling is True
 
 
 class TestTrainSetupPlatform:
