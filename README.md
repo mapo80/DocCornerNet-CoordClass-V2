@@ -564,6 +564,17 @@ python -m export \
     --representative_data /path/to/dataset/images
 ```
 
+TFLite int8 full-quant + `100%` XNNPACK delegate with WASM/v1-compatible `SimCCPacked` outputs:
+
+```bash
+python -m export \
+    --weights models/v2_best_full_current \
+    --output_dir models/v2_best_full_current/export_tflite_full_int8_xnn_simcc \
+    --format tflite_int8 \
+    --output_mode simcc_packed \
+    --representative_data ../dataset/DocCornerDataset
+```
+
 SavedModel + TFLite:
 
 ```bash
@@ -580,6 +591,7 @@ python -m export \
 | `--weights` | (required) | Path to model directory or `.weights.h5` file | If directory, auto-loads `config.json` + `best_model.weights.h5` |
 | `--output_dir` | `./exported_v2` | Output directory for exported models | Created automatically if missing |
 | `--format` | `savedmodel tflite` | Export format(s) | One or more of: `savedmodel`, `tflite`, `tflite_int8`, `onnx`. Multiple formats can be specified |
+| `--output_mode` | `decoded` | Export output contract | `decoded` = `[coords, score_logit]`; `heads` = raw head tensors; `simcc_packed` = `[score_logit, simcc_xy]` with `simcc_xy=[B,num_bins,8]` for v1/WASM-compatible INT8 deployment |
 | `--representative_data` | `None` | Path to images directory for int8 calibration | Required only for `tflite_int8`. Uses ~100 images to determine quantization ranges |
 
 **Model config overrides** (only needed if `config.json` is not available):
@@ -601,6 +613,34 @@ python -m export \
 | `tflite` | `model.tflite` | ~600 KB | Mobile/edge (float32) |
 | `tflite_int8` | `model_int8.tflite` | ~200 KB | Mobile/edge (quantized, fastest) |
 | `onnx` | `model.onnx` | ~2 MB | Cross-framework inference |
+
+### Original vs INT8 Full-Delegate Accuracy
+
+Specific comparison for [`models/v2_best_full_current`](./models/v2_best_full_current) against its full-quantized, `100%` XNNPACK-delegated export:
+
+- export path: [`models/v2_best_full_current/export_tflite_full_int8_xnn_simcc/model_int8_simcc.tflite`](./models/v2_best_full_current/export_tflite_full_int8_xnn_simcc/model_int8_simcc.tflite)
+- delegate report: [`model_int8_simcc_delegate_report.json`](./models/v2_best_full_current/export_tflite_full_int8_xnn_simcc/model_int8_simcc_delegate_report.json)
+- deployment contract: input `int8 [1,224,224,3]`, output 0 `score_logit int8 [1,1]`, output 1 `simcc_xy int8 [1,224,8]`
+- delegation status: `fully_delegated=true`, `execution_plan_nodes=1`, `delegate_plan_nodes=1`
+
+Evaluation was run on `dataset/DocCornerDataset` with the same preprocessing and the same `ValidationMetrics` used for the original Keras model. For the `INT8` export, coordinates are decoded from `SimCCPacked` outside the model, which matches the WASM consumer path.
+
+| Split | Variant | Mean IoU | Corner err mean | Corner err p95 | Recall@95 | Cls acc | F1 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `val` | Original checkpoint | `0.983706` | `1.04 px` | `2.63 px` | `96.58%` | `99.97%` | `99.98%` |
+| `val` | INT8 full delegate | `0.982226` | `1.13 px` | `2.95 px` | `95.97%` | `99.95%` | `99.97%` |
+| `test` | Original checkpoint | `0.864289` | `8.53 px` | `46.98 px` | `52.83%` | `97.53%` | `98.58%` |
+| `test` | INT8 full delegate | `0.861622` | `8.71 px` | `48.24 px` | `51.82%` | `97.76%` | `98.71%` |
+
+Delta `INT8 - original`:
+
+- `val`: mean IoU `-0.001480`, corner err mean `+0.09 px`, recall@95 `-0.60 pt`, cls acc `-0.01 pt`
+- `test`: mean IoU `-0.002667`, corner err mean `+0.17 px`, recall@95 `-1.01 pt`, cls acc `+0.23 pt`
+
+Practical takeaway:
+
+- geometry accuracy stays slightly better on the original checkpoint
+- the `INT8` export keeps almost all of the original accuracy while satisfying the deployment constraints `int8 + 100% XNNPACK + WASM/v1-compatible output contract`
 
 ## Tests
 

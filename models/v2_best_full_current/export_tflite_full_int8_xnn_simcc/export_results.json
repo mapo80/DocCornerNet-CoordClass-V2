@@ -3,10 +3,10 @@
     "tflite_int8": {
       "size_mb": 0.9594345092773438,
       "benchmark": {
-        "mean_ms": 6.260966619011015,
-        "std_ms": 3.779860817982024,
-        "p50_ms": 5.386541990446858,
-        "p95_ms": 9.339870855910702
+        "mean_ms": 6.48216246656375,
+        "std_ms": 3.2846411378991602,
+        "p50_ms": 5.299311989801936,
+        "p95_ms": 10.175887825607782
       },
       "delegate_report": {
         "nodes": 227,
@@ -35,6 +35,19 @@
         "output_details": [
           {
             "name": "StatefulPartitionedCall_1:1",
+            "index": 272,
+            "dtype": "int8",
+            "shape": [
+              1,
+              1
+            ],
+            "quantization": [
+              0.2705748975276947,
+              -44
+            ]
+          },
+          {
+            "name": "StatefulPartitionedCall_1:0",
             "index": 433,
             "dtype": "int8",
             "shape": [
@@ -45,19 +58,6 @@
             "quantization": [
               0.07454432547092438,
               62
-            ]
-          },
-          {
-            "name": "StatefulPartitionedCall_1:0",
-            "index": 272,
-            "dtype": "int8",
-            "shape": [
-              1,
-              1
-            ],
-            "quantization": [
-              0.2705748975276947,
-              -44
             ]
           }
         ],
